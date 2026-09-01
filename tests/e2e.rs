@@ -1,6 +1,6 @@
 use ferrumdns::config::Config;
 use ferrumdns::context::{build_query, ClientProto, QueryContext};
-use ferrumdns::runtime::Runtime;
+use ferrumdns::runtime::{Live, Runtime};
 use hickory_proto::rr::RecordType;
 use std::net::IpAddr;
 
@@ -106,6 +106,105 @@ plugins:
         "expected cache hit, trace={:?}",
         ctx2.trace
     );
+}
+
+#[tokio::test]
+async fn lazy_cache_skips_lookup_on_refresh() {
+    let yaml = r#"
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      ttl: 1
+      entries: ["9.9.9.9 lazy.test"]
+  - tag: cache
+    type: cache
+    args:
+      size: 64
+      lazy_cache_ttl: 86400
+      lazy_cache_reply_ttl: 5
+  - tag: main
+    type: sequence
+    args:
+      - exec: $cache
+      - matches: has_resp
+        exec: accept
+      - exec: $hosts
+"#;
+    let cfg = Config::from_yaml(yaml).unwrap();
+    let rt = Runtime::build(cfg).await.unwrap();
+
+    let q = build_query("lazy.test.", RecordType::A).unwrap();
+    let mut ctx = QueryContext::new(q.clone(), None, ClientProto::Udp);
+    rt.handle_query(&mut ctx, "main").await.unwrap();
+    assert!(ctx.has_resp());
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let mut lazy = QueryContext::new(q.clone(), None, ClientProto::Udp);
+    lazy.trace_enabled = true;
+    rt.handle_query(&mut lazy, "main").await.unwrap();
+    assert!(lazy.has_resp());
+    assert!(
+        lazy.trace
+            .iter()
+            .any(|t| t.event == "lazy_hit" && t.plugin == "cache"),
+        "expected lazy_hit, trace={:?}",
+        lazy.trace
+    );
+    let ttl = lazy.response().unwrap().answers()[0].ttl();
+    assert_eq!(ttl, 5, "lazy reply TTL");
+
+    // background refresh should rewrite the entry with a fresh 1s TTL
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut again = QueryContext::new(q, None, ClientProto::Udp);
+    again.trace_enabled = true;
+    rt.handle_query(&mut again, "main").await.unwrap();
+    assert!(again.has_resp());
+    assert!(
+        again
+            .trace
+            .iter()
+            .any(|t| t.event == "hit" && t.plugin == "cache"),
+        "refresh should have stored a fresh entry, trace={:?}",
+        again.trace
+    );
+}
+
+#[tokio::test]
+async fn live_reload_swaps_hosts() {
+    let yaml1 = r#"
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries: ["1.1.1.1 a.test"]
+  - tag: main
+    type: sequence
+    args:
+      - exec: $hosts
+"#;
+    let yaml2 = r#"
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries: ["2.2.2.2 a.test"]
+  - tag: main
+    type: sequence
+    args:
+      - exec: $hosts
+"#;
+    let live = Live::new(Runtime::build(Config::from_yaml(yaml1).unwrap()).await.unwrap());
+    let q = build_query("a.test.", RecordType::A).unwrap();
+    let mut ctx = QueryContext::new(q.clone(), None, ClientProto::Udp);
+    live.get().handle_query(&mut ctx, "main").await.unwrap();
+    assert_eq!(ctx.answer_ips()[0], "1.1.1.1".parse::<IpAddr>().unwrap());
+
+    live.swap(Runtime::build(Config::from_yaml(yaml2).unwrap()).await.unwrap());
+    let mut ctx = QueryContext::new(q, None, ClientProto::Udp);
+    live.get().handle_query(&mut ctx, "main").await.unwrap();
+    assert_eq!(ctx.answer_ips()[0], "2.2.2.2".parse::<IpAddr>().unwrap());
 }
 
 #[tokio::test]

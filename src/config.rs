@@ -84,6 +84,9 @@ pub struct ListenerConfig {
     pub url_path: Option<String>,
     #[serde(default)]
     pub idle_timeout: Option<u64>,
+    /// UDP SO_REUSEPORT worker count. Default: min(8, CPU count).
+    #[serde(default)]
+    pub workers: Option<u32>,
 }
 
 fn default_proto() -> String {
@@ -206,6 +209,11 @@ impl Config {
                                 .and_then(|v| v.as_str())
                                 .map(str::to_string),
                             idle_timeout: p.args.get("idle_timeout").and_then(|v| v.as_u64()),
+                            workers: p
+                                .args
+                                .get("workers")
+                                .and_then(|v| v.as_u64())
+                                .map(|n| n as u32),
                         }],
                     });
                 }
@@ -244,6 +252,25 @@ plugins:
         assert_eq!(cfg.servers.len(), 1);
         assert_eq!(cfg.servers[0].exec, "main");
         assert_eq!(cfg.servers[0].listeners[0].protocol, "udp");
+        assert_eq!(cfg.servers[0].listeners[0].workers, None);
+    }
+
+    #[test]
+    fn parses_workers_on_udp_server() {
+        let yaml = r#"
+plugins:
+  - tag: main
+    type: sequence
+    args:
+      - exec: accept
+  - type: udp_server
+    args:
+      entry: main
+      listen: 127.0.0.1:5353
+      workers: 4
+"#;
+        let cfg = Config::from_yaml(yaml).unwrap();
+        assert_eq!(cfg.servers[0].listeners[0].workers, Some(4));
     }
 
     #[test]

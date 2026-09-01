@@ -13,37 +13,89 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ListenerConfig;
 use crate::context::{ClientProto, QueryContext};
 use crate::dnsutil::{self, Incoming};
 use crate::error::{Error, Result};
-use crate::plugin::{Action, Registry};
-use crate::runtime::Runtime;
+use crate::plugin::Action;
+use crate::runtime::{Live, Runtime};
 
-pub async fn spawn_listener(rt: Arc<Runtime>, entry: String, timeout: Duration, l: ListenerConfig) -> Result<()> {
+pub async fn spawn_listener(
+    live: Live,
+    entry: String,
+    timeout: Duration,
+    l: ListenerConfig,
+) -> Result<()> {
     let proto = l.protocol.to_ascii_lowercase();
     let idle = Duration::from_secs(l.idle_timeout.unwrap_or(10).max(1));
     match proto.as_str() {
-        "udp" | "" => spawn_udp(rt, entry, timeout, l.addr).await,
-        "tcp" => spawn_tcp(rt, entry, timeout, idle, l.addr, ClientProto::Tcp, None).await,
+        "udp" | "" => {
+            let n = udp_worker_count(&l);
+            spawn_udp(live, entry, timeout, l.addr, n).await
+        }
+        "tcp" => spawn_tcp(live, entry, timeout, idle, l.addr, ClientProto::Tcp, None).await,
         "tls" | "dot" => {
             let acceptor = tls_acceptor(
-                l.cert.as_deref().ok_or_else(|| Error::config("tls listener needs cert"))?,
-                l.key.as_deref().ok_or_else(|| Error::config("tls listener needs key"))?,
+                l.cert
+                    .as_deref()
+                    .ok_or_else(|| Error::config("tls listener needs cert"))?,
+                l.key
+                    .as_deref()
+                    .ok_or_else(|| Error::config("tls listener needs key"))?,
+                &[],
             )?;
-            spawn_tcp(rt, entry, timeout, idle, l.addr, ClientProto::Tls, Some(acceptor)).await
+            spawn_tcp(
+                live,
+                entry,
+                timeout,
+                idle,
+                l.addr,
+                ClientProto::Tls,
+                Some(acceptor),
+            )
+            .await
         }
-        "doh" | "https" | "http" => spawn_doh(rt, entry, timeout, l).await,
+        "doh" | "https" | "http" => spawn_doh(live, entry, timeout, l).await,
         other => Err(Error::config(format!("unknown listener protocol `{other}`"))),
     }
 }
 
-async fn spawn_udp(rt: Arc<Runtime>, entry: String, timeout: Duration, addr: String) -> Result<()> {
-    let sock = bind_udp(&addr)?;
-    tracing::info!(%addr, entry = %entry, "udp listen");
+fn udp_worker_count(l: &ListenerConfig) -> usize {
+    match l.workers {
+        Some(n) if n > 0 => n as usize,
+        _ => std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 8))
+            .unwrap_or(2),
+    }
+}
+
+async fn spawn_udp(
+    live: Live,
+    entry: String,
+    timeout: Duration,
+    addr: String,
+    workers: usize,
+) -> Result<()> {
+    let n = workers.max(1);
+    tracing::info!(%addr, entry = %entry, workers = n, "udp listen");
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let sock = bind_udp(&addr)?;
+        let live = live.clone();
+        let entry = entry.clone();
+        handles.push(tokio::spawn(async move {
+            udp_loop(live, entry, timeout, sock).await;
+        }));
+        tracing::debug!(worker = i, %addr, "udp worker bound");
+    }
+    futures::future::join_all(handles).await;
+    Ok(())
+}
+
+async fn udp_loop(live: Live, entry: String, timeout: Duration, sock: UdpSocket) {
     let sock = Arc::new(sock);
     loop {
         let mut buf = vec![0u8; 65535];
@@ -54,7 +106,7 @@ async fn spawn_udp(rt: Arc<Runtime>, entry: String, timeout: Duration, addr: Str
                 continue;
             }
         };
-        let rt = rt.clone();
+        let live = live.clone();
         let entry = entry.clone();
         let sock = sock.clone();
         tokio::spawn(async move {
@@ -81,6 +133,7 @@ async fn spawn_udp(rt: Arc<Runtime>, entry: String, timeout: Duration, addr: Str
                 Incoming::Ok => {}
             }
             let mut ctx = QueryContext::new(q, Some(peer.ip()), ClientProto::Udp);
+            let rt = live.get();
             if let Err(e) = handle(&rt, &entry, &mut ctx, timeout).await {
                 tracing::debug!(err = %e, "udp handle");
                 return;
@@ -114,7 +167,7 @@ fn bind_udp(addr: &str) -> Result<UdpSocket> {
 }
 
 async fn spawn_tcp(
-    rt: Arc<Runtime>,
+    live: Live,
     entry: String,
     timeout: Duration,
     idle: Duration,
@@ -132,18 +185,32 @@ async fn spawn_tcp(
                 continue;
             }
         };
-        let rt = rt.clone();
+        let live = live.clone();
         let entry = entry.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
+            let rt = live.get();
             let result = async {
                 if let Some(acc) = tls {
-                    let mut tls = acc.accept(stream).await.map_err(|e| Error::protocol(e.to_string()))?;
-                    serve_framed(&rt, &entry, timeout, idle, proto, Some(peer.ip()), &mut tls).await
+                    let mut tls = acc
+                        .accept(stream)
+                        .await
+                        .map_err(|e| Error::protocol(e.to_string()))?;
+                    serve_framed(&rt, &entry, timeout, idle, proto, Some(peer.ip()), &mut tls)
+                        .await
                 } else {
                     let mut stream = stream;
                     let _ = stream.set_nodelay(true);
-                    serve_framed(&rt, &entry, timeout, idle, proto, Some(peer.ip()), &mut stream).await
+                    serve_framed(
+                        &rt,
+                        &entry,
+                        timeout,
+                        idle,
+                        proto,
+                        Some(peer.ip()),
+                        &mut stream,
+                    )
+                    .await
                 }
             };
             if let Err(e) = result.await {
@@ -217,17 +284,14 @@ async fn write_tcp_response<S: AsyncWriteExt + Unpin>(
 
 #[derive(Clone)]
 struct DohState {
-    rt: Arc<Runtime>,
+    live: Live,
     entry: String,
     timeout: Duration,
 }
 
-async fn spawn_doh(rt: Arc<Runtime>, entry: String, timeout: Duration, l: ListenerConfig) -> Result<()> {
-    if l.cert.is_some() || l.key.is_some() {
-        tracing::warn!("doh/http listener ignores cert/key — terminate TLS in front, or use protocol: tls for DoT");
-    }
+async fn spawn_doh(live: Live, entry: String, timeout: Duration, l: ListenerConfig) -> Result<()> {
     let state = DohState {
-        rt,
+        live,
         entry,
         timeout,
     };
@@ -242,11 +306,60 @@ async fn spawn_doh(rt: Arc<Runtime>, entry: String, timeout: Duration, l: Listen
         .addr
         .parse()
         .map_err(|e| Error::config(format!("bad doh addr: {e}")))?;
-    tracing::info!(%addr, path = %path, "doh listen (http)");
-    let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| Error::config(e.to_string()))
+
+    match (l.cert.as_deref(), l.key.as_deref()) {
+        (Some(cert), Some(key)) => {
+            let acceptor = tls_acceptor(cert, key, &[b"h2", b"http/1.1"])?;
+            let listener = TcpListener::bind(addr).await?;
+            tracing::info!(%addr, path = %path, "doh listen (https)");
+            let incoming = TlsIncoming { listener, acceptor };
+            axum::serve(incoming, app)
+                .await
+                .map_err(|e| Error::config(e.to_string()))
+        }
+        (None, None) => {
+            tracing::info!(%addr, path = %path, "doh listen (http)");
+            let listener = TcpListener::bind(addr).await?;
+            axum::serve(listener, app)
+                .await
+                .map_err(|e| Error::config(e.to_string()))
+        }
+        _ => Err(Error::config(
+            "doh https needs both cert and key (omit both for plaintext behind a TLS terminator)",
+        )),
+    }
+}
+
+/// axum 0.8 `Listener` wrapping a rustls acceptor so DoH can speak HTTPS.
+struct TlsIncoming {
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+impl axum::serve::Listener for TlsIncoming {
+    type Io = tokio_rustls::server::TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(err = %e, "doh tcp accept");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            match self.acceptor.accept(stream).await {
+                Ok(tls) => return (tls, addr),
+                Err(e) => tracing::debug!(err = %e, "doh tls handshake"),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
 }
 
 async fn doh_post(State(st): State<DohState>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
@@ -262,7 +375,9 @@ async fn doh_get(State(st): State<DohState>, uri: Uri) -> impl IntoResponse {
 
 fn dns_query_param(query: &str) -> Option<Vec<u8>> {
     for part in query.split('&') {
-        let (k, v) = part.split_once('=')?;
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
         if k != "dns" {
             continue;
         }
@@ -285,7 +400,10 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
+            if let Ok(b) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
                 out.push(b as char);
                 i += 3;
                 continue;
@@ -305,7 +423,8 @@ async fn doh_handle(st: &DohState, _headers: HeaderMap, body: Bytes) -> axum::re
         }
     };
     let mut ctx = QueryContext::new(q, None, ClientProto::Https);
-    if let Err(e) = handle(&st.rt, &st.entry, &mut ctx, st.timeout).await {
+    let rt = st.live.get();
+    if let Err(e) = handle(&rt, &st.entry, &mut ctx, st.timeout).await {
         return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
     }
     match ctx.response().and_then(|r| dnsutil::encode(r).ok()) {
@@ -319,14 +438,15 @@ async fn doh_handle(st: &DohState, _headers: HeaderMap, body: Bytes) -> axum::re
     }
 }
 
-fn tls_acceptor(cert: &str, key: &str) -> Result<TlsAcceptor> {
+fn tls_acceptor(cert: &str, key: &str, alpn: &[&[u8]]) -> Result<TlsAcceptor> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certs = load_certs(Path::new(cert))?;
     let key = load_key(Path::new(key))?;
-    let cfg = ServerConfig::builder()
+    let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| Error::config(e.to_string()))?;
+    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(TlsAcceptor::from(Arc::new(cfg)))
 }
 
@@ -345,13 +465,23 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
             Ok(Some(rustls_pemfile::Item::Pkcs1Key(k))) => return Ok(PrivateKeyDer::Pkcs1(k)),
             Ok(Some(rustls_pemfile::Item::Sec1Key(k))) => return Ok(PrivateKeyDer::Sec1(k)),
             Ok(Some(_)) => continue,
-            Ok(None) => return Err(Error::config(format!("no private key in {}", path.display()))),
+            Ok(None) => {
+                return Err(Error::config(format!(
+                    "no private key in {}",
+                    path.display()
+                )))
+            }
             Err(e) => return Err(Error::config(e.to_string())),
         }
     }
 }
 
-pub async fn handle(rt: &Runtime, entry: &str, ctx: &mut QueryContext, timeout: Duration) -> Result<()> {
+pub async fn handle(
+    rt: &Runtime,
+    entry: &str,
+    ctx: &mut QueryContext,
+    timeout: Duration,
+) -> Result<()> {
     match dnsutil::classify_incoming(ctx.query()) {
         Incoming::Drop => return Ok(()),
         Incoming::NotImp => {
@@ -385,8 +515,4 @@ pub async fn handle(rt: &Runtime, entry: &str, ctx: &mut QueryContext, timeout: 
     let us = ctx.start.elapsed().as_micros() as u64;
     rt.metrics.observe_query(us);
     Ok(())
-}
-
-pub fn registry_of(rt: &Runtime) -> &Registry {
-    &rt.registry
 }

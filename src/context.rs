@@ -37,6 +37,8 @@ pub struct QueryContext {
     marks: HashSet<u32>,
     pub trace: Vec<TraceEvent>,
     pub trace_enabled: bool,
+    /// Skip cache lookup (used by lazy-cache background refresh).
+    pub skip_cache: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -61,6 +63,7 @@ impl QueryContext {
             marks: HashSet::new(),
             trace: Vec::new(),
             trace_enabled: false,
+            skip_cache: false,
         }
     }
 
@@ -160,6 +163,7 @@ impl QueryContext {
             marks: self.marks.clone(),
             trace: Vec::new(),
             trace_enabled: false,
+            skip_cache: true,
         }
     }
 

@@ -41,8 +41,10 @@ plugins:
       upstreams:
         - addr: https://cloudflare-dns.com/dns-query
           tag: cloudflare
+          bootstrap: 1.1.1.1
         - addr: https://dns.google/dns-query
           tag: google
+          bootstrap: 8.8.8.8
         - addr: tls://1.1.1.1
           tag: cloudflare-dot
 
@@ -66,5 +68,6 @@ servers:
     listeners:
       - protocol: udp
         addr: 0.0.0.0:53
+        workers: 4
       - protocol: tcp
         addr: 0.0.0.0:53

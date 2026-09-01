@@ -5,20 +5,19 @@ use axum::Json;
 use axum::Router;
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use crate::context::{build_query, ClientProto, QueryContext, TraceEvent};
 use crate::dnsutil;
 use crate::error::Result;
 use crate::metrics::Snapshot;
-use crate::runtime::Runtime;
+use crate::runtime::Live;
 
 #[derive(Clone)]
 struct AppState {
-    rt: Arc<Runtime>,
+    live: Live,
 }
 
-pub async fn serve(rt: Arc<Runtime>, bind: &str) -> Result<()> {
+pub async fn serve(live: Live, bind: &str) -> Result<()> {
     let addr: SocketAddr = bind
         .parse()
         .map_err(|e| crate::error::Error::config(format!("bad api addr {bind}: {e}")))?;
@@ -29,7 +28,7 @@ pub async fn serve(rt: Arc<Runtime>, bind: &str) -> Result<()> {
         .route("/api/plugins", get(plugins))
         .route("/api/query", post(query))
         .route("/api/cache/flush", post(flush))
-        .with_state(AppState { rt });
+        .with_state(AppState { live });
     tracing::info!(%addr, "admin api");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
@@ -42,15 +41,16 @@ async fn health() -> &'static str {
 }
 
 async fn metrics_prom(State(st): State<AppState>) -> String {
-    st.rt.metrics.prometheus()
+    st.live.get().metrics.prometheus()
 }
 
 async fn stats(State(st): State<AppState>) -> Json<Snapshot> {
-    Json(st.rt.metrics.snapshot())
+    Json(st.live.get().metrics.snapshot())
 }
 
 async fn plugins(State(st): State<AppState>) -> Json<serde_json::Value> {
-    let r = &st.rt.registry;
+    let rt = st.live.get();
+    let r = &rt.registry;
     Json(serde_json::json!({
         "executables": r.execs.keys().collect::<Vec<_>>(),
         "domain_sets": r.domains.keys().collect::<Vec<_>>(),
@@ -86,6 +86,7 @@ struct QueryResp {
 }
 
 async fn query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> std::result::Result<Json<QueryResp>, (StatusCode, String)> {
+    let rt = st.live.get();
     let qtype = dnsutil::qtype_from_str(&req.qtype).ok_or((StatusCode::BAD_REQUEST, "bad qtype".into()))?;
     let mut name = req.name.clone();
     if !name.ends_with('.') {
@@ -96,10 +97,9 @@ async fn query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> std::re
     ctx.trace_enabled = true;
     let entry = req
         .entry
-        .or_else(|| st.rt.registry.default_entry.clone())
+        .or_else(|| rt.registry.default_entry.clone())
         .ok_or((StatusCode::BAD_REQUEST, "no entry".into()))?;
-    st.rt
-        .handle_query(&mut ctx, &entry)
+    rt.handle_query(&mut ctx, &entry)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
@@ -117,7 +117,7 @@ async fn query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> std::re
         })
         .unwrap_or_default();
     let cache_hit = ctx.trace.iter().any(|t| {
-        (t.event == "hit" || t.event == "lazy_hit") && st.rt.registry.caches.contains_key(&t.plugin)
+        (t.event == "hit" || t.event == "lazy_hit") && rt.registry.caches.contains_key(&t.plugin)
     });
     Ok(Json(QueryResp {
         rcode,
@@ -129,7 +129,8 @@ async fn query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> std::re
 }
 
 async fn flush(State(st): State<AppState>) -> Json<serde_json::Value> {
-    for c in st.rt.registry.caches.values() {
+    let rt = st.live.get();
+    for c in rt.registry.caches.values() {
         c.flush();
     }
     Json(serde_json::json!({ "ok": true }))

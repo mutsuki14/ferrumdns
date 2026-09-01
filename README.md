@@ -17,10 +17,11 @@ FerrumDNS 是一个用 **Rust** 编写的高性能 DNS 转发器。配置模型�
 |---|---|---|
 | Runtime | GC | zero-GC, tokio |
 | Pipeline | plugin sequence | plugin sequence (compatible YAML) |
-| Listen | UDP / TCP / DoT / DoH / DoQ / DoH3 | UDP / TCP / DoT / DoH (DoH listener is HTTP; terminate TLS in front) |
-| Upstream | UDP / TCP / DoT / DoH / DoQ / DoH3 | UDP / TCP / DoT / DoH |
-| Cache | sharded LRU + lazy TTL | sharded LRU + lazy TTL |
+| Listen | UDP / TCP / DoT / DoH / DoQ / DoH3 | UDP / TCP / DoT / DoH (HTTPS with `cert`/`key`, or HTTP behind a terminator) |
+| Upstream | UDP / TCP / DoT / DoH / DoQ / DoH3 | UDP / TCP / DoT / DoH (`bootstrap` / `dial_addr`) |
+| Cache | sharded LRU + lazy TTL | sharded LRU + lazy TTL + background refresh |
 | Admin | HTTP + Prometheus | HTTP JSON + Prometheus |
+| Reload | SIGHUP | SIGHUP swaps plugins, keeps sockets |
 
 ## Install
 
@@ -93,6 +94,8 @@ sudo install -m 0755 target/release/ferrumdns /usr/local/bin/ferrumdns
 sudo cp systemd/ferrumdns.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ferrumdns
+# later: edit /etc/ferrumdns/config.yaml then
+sudo systemctl reload ferrumdns   # SIGHUP — plugins swap, sockets stay
 ```
 
 ## Quick start
@@ -143,6 +146,7 @@ plugins:
       concurrent: 2
       upstreams:
         - addr: https://cloudflare-dns.com/dns-query
+          bootstrap: 1.1.1.1
         - addr: tls://1.1.1.1
         - addr: udp://8.8.8.8:53
 
@@ -181,7 +185,7 @@ client ──► UDP/TCP/DoT/DoH listener
          sequence (main)
            ├─ matchers  (qname / qtype / client_ip / resp_ip / has_resp / …)
            ├─ hosts / blackhole / redirect / ttl
-           ├─ sharded LRU cache  (lazy refresh)
+           ├─ sharded LRU cache  (lazy TTL + background refresh)
            ├─ forward  (race N encrypted upstreams)
            └─ fallback (primary + secondary, optional always_standby)
 ```
@@ -194,7 +198,7 @@ Each query carries a `QueryContext` through the pipeline. Plugins either fill a 
 |---|---|
 | `sequence` | Ordered steps with `matches` + `exec` |
 | `forward` / `fast_forward` | Concurrent upstream exchange |
-| `cache` | Sharded LRU, optional lazy TTL |
+| `cache` | Sharded LRU, optional lazy TTL + background refresh |
 | `hosts` | Static A/AAAA |
 | `domain_set` | Suffix / `full:` / `keyword:` / `regexp:` / `domain:` |
 | `ip_set` | CIDR set |
@@ -216,7 +220,42 @@ tls://1.1.1.1          # DoT, port 853
 https://dns.google/dns-query
 ```
 
+Hostname DoH/DoT can pin the IP so the forwarder does not depend on the system resolver:
+
+```yaml
+- addr: https://cloudflare-dns.com/dns-query
+  bootstrap: 1.1.1.1          # resolve the hostname via this IP (port 53)
+  # dial_addr: 1.1.1.1        # or skip DNS entirely and dial this IP
+  # insecure_skip_verify: true
+```
+
 `concurrent: N` races the first N upstreams and takes the first successful answer.
+
+TCP and DoT reuse idle RFC 7766 sessions (pool of 8 per upstream). DoH reuses HTTP/2 via reqwest.
+
+### Listeners
+
+```yaml
+servers:
+  - exec: main
+    listeners:
+      - protocol: udp
+        addr: 0.0.0.0:53
+        workers: 4            # SO_REUSEPORT; default min(8, CPU)
+      - protocol: tcp
+        addr: 0.0.0.0:53
+      - protocol: tls         # DoT
+        addr: 0.0.0.0:853
+        cert: /etc/ferrumdns/fullchain.pem
+        key: /etc/ferrumdns/privkey.pem
+      - protocol: doh         # DoH — cert+key → HTTPS; omit both for HTTP
+        addr: 0.0.0.0:443
+        cert: /etc/ferrumdns/fullchain.pem
+        key: /etc/ferrumdns/privkey.pem
+        url_path: /dns-query
+```
+
+SIGHUP (`systemctl reload ferrumdns` / `kill -HUP $pid`) rebuilds plugins from the same config file. Listen address and certificate path changes still need a restart.
 
 ## Admin API
 
@@ -239,10 +278,12 @@ Relative `files:` entries (`hosts`, `domain_set`, `ip_set`) and `include:` are r
 
 ## Performance notes
 
-- Multi-thread tokio runtime, `SO_REUSEPORT` on UDP
+- Multi-thread tokio runtime, UDP `SO_REUSEPORT` workers (default `min(8, CPU)`)
 - 16-way sharded cache to keep LRU locks off the hot path
-- DoH connection pooling via reqwest/hyper HTTP/2
-- DoT / TCP use length-prefixed RFC 7766 sessions
+- Lazy cache: serve a short TTL immediately, refresh in the background
+- DoH connection pooling via reqwest/hyper HTTP/2; hostname pin via `bootstrap` / `dial_addr`
+- DoT / TCP reuse length-prefixed RFC 7766 sessions (idle pool of 8)
+- SIGHUP reloads plugins without dropping sockets
 - Release profile: LTO thin, `opt-level=3`, stripped
 
 ## Development
@@ -265,4 +306,8 @@ MIT. Architecture inspired by mosdns / mosdns-x (GPL-3.0); this codebase is orig
 
 ## Status
 
-v0.1 — usable as a LAN / homelab / OpenWrt-class forwarder. Planned: DoQ, DoH3, geosite/geoip dat, SIGHUP reload, ECS.
+v0.1 — usable as a LAN / homelab / OpenWrt-class forwarder.
+
+Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, UDP `SO_REUSEPORT` workers, TCP/DoT connection reuse, SIGHUP plugin reload.
+
+Planned: DoQ, DoH3, geosite/geoip dat, ECS.

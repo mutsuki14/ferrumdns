@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use hickory_proto::op::ResponseCode;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::context::QueryContext;
@@ -11,6 +11,7 @@ use crate::dnsutil;
 use crate::error::Result;
 use crate::metrics::Metrics;
 use crate::plugin::{Action, Executable};
+use crate::runtime::Runtime;
 
 struct Entry {
     wire: Vec<u8>,
@@ -84,6 +85,8 @@ pub struct Cache {
     lazy_reply_ttl: u32,
     cache_everything: bool,
     metrics: Arc<Metrics>,
+    refresh: OnceLock<(Weak<Runtime>, String)>,
+    inflight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Cache {
@@ -111,6 +114,8 @@ impl Cache {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             metrics,
+            refresh: OnceLock::new(),
+            inflight: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -197,6 +202,33 @@ impl Cache {
             }
         }
     }
+
+    pub fn bind_refresh(&self, rt: Weak<Runtime>, entry: String) {
+        let _ = self.refresh.set((rt, entry));
+    }
+
+    fn kick_refresh(&self, ctx: &QueryContext, key: &str) {
+        if ctx.skip_cache {
+            return;
+        }
+        let Some((weak, entry)) = self.refresh.get() else {
+            return;
+        };
+        if !self.inflight.lock().insert(key.to_string()) {
+            return;
+        }
+        let mut bg = ctx.clone_for_lazy();
+        let weak = weak.clone();
+        let entry = entry.clone();
+        let inflight = self.inflight.clone();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            if let Some(rt) = weak.upgrade() {
+                let _ = rt.handle_query(&mut bg, &entry).await;
+            }
+            inflight.lock().remove(&key);
+        });
+    }
 }
 
 #[async_trait]
@@ -206,6 +238,12 @@ impl Executable for Cache {
             return Ok(Action::Continue);
         };
 
+        if ctx.skip_cache {
+            self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+            ctx.push_trace(&self.tag, "miss", "refresh");
+            return Ok(Action::Continue);
+        }
+
         if let Some((wire, lazy, stored)) = self.lookup(&key) {
             if let Ok(mut msg) = dnsutil::decode(&wire) {
                 let elapsed = Instant::now().saturating_duration_since(stored).as_secs() as u32;
@@ -213,6 +251,7 @@ impl Executable for Cache {
                     dnsutil::set_all_ttl(&mut msg, self.lazy_reply_ttl);
                     self.metrics.cache_lazy_hits.fetch_add(1, Ordering::Relaxed);
                     ctx.push_trace(&self.tag, "lazy_hit", &key);
+                    self.kick_refresh(ctx, &key);
                 } else {
                     dnsutil::subtract_ttl(&mut msg, elapsed);
                     ctx.push_trace(&self.tag, "hit", &key);
@@ -251,5 +290,41 @@ mod tests {
         assert!(s.map.contains_key("c"));
         assert!(!s.map.contains_key("b"));
         assert_eq!(s.map["a"].wire, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn skip_cache_bypasses_stored_hit() {
+        use crate::context::{build_query, ClientProto, QueryContext};
+        use crate::dnsutil;
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+
+        let metrics = crate::metrics::Metrics::new();
+        let args: serde_yaml::Value = serde_yaml::from_str("size: 64").unwrap();
+        let cache = Cache::from_args("cache", &args, metrics);
+
+        let q = build_query("skip.test.", RecordType::A).unwrap();
+        let mut ctx = QueryContext::new(q.clone(), None, ClientProto::Udp);
+        let mut resp = dnsutil::reply_skeleton(ctx.query(), hickory_proto::op::ResponseCode::NoError);
+        resp.add_answer(dnsutil::record_a(
+            Name::from_str("skip.test.").unwrap(),
+            60,
+            "9.9.9.9".parse().unwrap(),
+        ));
+        ctx.set_response(resp);
+        cache.maybe_store(&ctx);
+
+        let mut hit = QueryContext::new(q.clone(), None, ClientProto::Udp);
+        hit.trace_enabled = true;
+        cache.exec(&mut hit).await.unwrap();
+        assert!(hit.has_resp());
+        assert!(hit.trace.iter().any(|t| t.event == "hit"));
+
+        let mut skip = QueryContext::new(q, None, ClientProto::Udp);
+        skip.skip_cache = true;
+        skip.trace_enabled = true;
+        cache.exec(&mut skip).await.unwrap();
+        assert!(!skip.has_resp());
+        assert!(skip.trace.iter().any(|t| t.detail == "refresh"));
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -19,6 +20,80 @@ pub struct Runtime {
     pub registry: Arc<Registry>,
     pub metrics: Arc<Metrics>,
     pub config: Config,
+}
+
+/// Hot-swappable runtime used by listeners so SIGHUP can rebuild plugins
+/// without dropping UDP/TCP sockets.
+#[derive(Clone)]
+pub struct Live {
+    inner: Arc<parking_lot::RwLock<Arc<Runtime>>>,
+}
+
+impl Live {
+    pub fn new(rt: Arc<Runtime>) -> Self {
+        Self {
+            inner: Arc::new(parking_lot::RwLock::new(rt)),
+        }
+    }
+
+    pub fn get(&self) -> Arc<Runtime> {
+        self.inner.read().clone()
+    }
+
+    pub fn swap(&self, rt: Arc<Runtime>) {
+        *self.inner.write() = rt;
+    }
+
+    pub async fn serve(self) -> Result<()> {
+        let mut handles = Vec::new();
+        let snapshot = self.get();
+        for srv in &snapshot.config.servers {
+            let entry = if srv.exec.is_empty() {
+                snapshot
+                    .registry
+                    .default_entry
+                    .clone()
+                    .ok_or_else(|| Error::config("server has no exec/entry"))?
+            } else {
+                srv.exec.clone()
+            };
+            let timeout = Duration::from_secs(srv.timeout.max(1));
+            for l in &srv.listeners {
+                let live = self.clone();
+                let entry = entry.clone();
+                let l = l.clone();
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = server::spawn_listener(live, entry, timeout, l).await {
+                        tracing::error!(err = %e, "listener exited");
+                    }
+                }));
+            }
+        }
+        if let Some(http) = &snapshot.config.api.http {
+            let live = self.clone();
+            let http = http.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = crate::api::serve(live, &http).await {
+                    tracing::error!(err = %e, "api exited");
+                }
+            }));
+        }
+        if handles.is_empty() {
+            return Err(Error::config(
+                "no servers configured — add a `servers` block or a udp_server plugin",
+            ));
+        }
+        tracing::info!(listeners = handles.len(), "ferrumdns running");
+        futures::future::join_all(handles).await;
+        Ok(())
+    }
+
+    pub async fn reload_file(&self, path: &PathBuf) -> Result<()> {
+        let cfg = Config::load_file(path)?;
+        let rt = Runtime::build(cfg).await?;
+        self.swap(rt);
+        Ok(())
+    }
 }
 
 impl Runtime {
@@ -119,53 +194,13 @@ impl Runtime {
         let final_reg = Arc::new(registry);
         let _ = slot.set(final_reg.clone());
 
-        Ok(Arc::new(Runtime {
+        let rt = Arc::new(Runtime {
             registry: final_reg,
             metrics,
             config,
-        }))
-    }
-
-    pub async fn serve(self: Arc<Self>) -> Result<()> {
-        let mut handles = Vec::new();
-        for srv in &self.config.servers {
-            let entry = if srv.exec.is_empty() {
-                self.registry
-                    .default_entry
-                    .clone()
-                    .ok_or_else(|| Error::config("server has no exec/entry"))?
-            } else {
-                srv.exec.clone()
-            };
-            let timeout = Duration::from_secs(srv.timeout.max(1));
-            for l in &srv.listeners {
-                let rt = self.clone();
-                let entry = entry.clone();
-                let l = l.clone();
-                handles.push(tokio::spawn(async move {
-                    if let Err(e) = server::spawn_listener(rt, entry, timeout, l).await {
-                        tracing::error!(err = %e, "listener exited");
-                    }
-                }));
-            }
-        }
-        if let Some(http) = &self.config.api.http {
-            let rt = self.clone();
-            let http = http.clone();
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = crate::api::serve(rt, &http).await {
-                    tracing::error!(err = %e, "api exited");
-                }
-            }));
-        }
-        if handles.is_empty() {
-            return Err(Error::config(
-                "no servers configured — add a `servers` block or a udp_server plugin",
-            ));
-        }
-        tracing::info!(listeners = handles.len(), "ferrumdns running");
-        futures::future::join_all(handles).await;
-        Ok(())
+        });
+        bind_cache_refresh(&rt);
+        Ok(rt)
     }
 
     pub async fn handle_query(
@@ -174,6 +209,16 @@ impl Runtime {
         entry: &str,
     ) -> Result<()> {
         server::handle(self, entry, ctx, Duration::from_secs(5)).await
+    }
+}
+
+fn bind_cache_refresh(rt: &Arc<Runtime>) {
+    let Some(entry) = rt.registry.default_entry.clone() else {
+        return;
+    };
+    let weak: Weak<Runtime> = Arc::downgrade(rt);
+    for c in rt.registry.caches.values() {
+        c.bind_refresh(weak.clone(), entry.clone());
     }
 }
 

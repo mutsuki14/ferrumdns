@@ -11,6 +11,6 @@ pub mod server;
 pub mod upstream;
 
 pub use config::Config;
-pub use runtime::Runtime;
+pub use runtime::{Live, Runtime};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

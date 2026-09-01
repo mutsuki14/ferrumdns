@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ferrumdns::{Config, Runtime, VERSION};
+use ferrumdns::{Config, Live, Runtime, VERSION};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -50,9 +50,15 @@ async fn main() -> Result<()> {
             tracing::info!(file = %config.display(), version = VERSION, "starting ferrumdns");
             let _ = rustls::crypto::ring::default_provider().install_default();
             let rt = Runtime::build(cfg).await.context("build runtime")?;
+            let live = Live::new(rt);
+            let reloader = live.clone();
+            let cfg_path = config.clone();
+            tokio::spawn(async move {
+                reload_loop(reloader, cfg_path).await;
+            });
             let shutdown = shutdown_signal();
             tokio::select! {
-                r = rt.serve() => r.context("serve")?,
+                r = live.serve() => r.context("serve")?,
                 _ = shutdown => tracing::info!("shutdown"),
             }
             Ok(())
@@ -69,6 +75,30 @@ fn init_log(level: &str) {
         .compact()
         .init();
 }
+
+/// SIGHUP rebuilds plugins from disk without dropping UDP/TCP sockets.
+/// Listen address / protocol changes still need a process restart.
+#[cfg(unix)]
+async fn reload_loop(live: Live, path: PathBuf) {
+    let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(err = %e, "could not install SIGHUP handler");
+            return;
+        }
+    };
+    loop {
+        hangup.recv().await;
+        tracing::info!(file = %path.display(), "SIGHUP: reloading plugins");
+        match live.reload_file(&path).await {
+            Ok(()) => tracing::info!("reload ok (listeners unchanged; cache rebuilt)"),
+            Err(e) => tracing::error!(err = %e, "reload failed; keeping previous config"),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn reload_loop(_live: Live, _path: PathBuf) {}
 
 async fn shutdown_signal() {
     let ctrl_c = async {
