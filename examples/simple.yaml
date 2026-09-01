@@ -1,0 +1,67 @@
+# Minimal FerrumDNS config — local hosts + Cloudflare/Google DoH.
+log:
+  level: info
+
+api:
+  http: 127.0.0.1:9090
+
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      ttl: 60
+      entries:
+        - "10.0.0.1 router.lan"
+        - "10.0.0.2 nas.lan"
+        - "app.lan 10.0.0.10"
+
+  - tag: cache
+    type: cache
+    args:
+      size: 8192
+      lazy_cache_ttl: 86400
+      lazy_cache_reply_ttl: 30
+
+  - tag: ads
+    type: domain_set
+    args:
+      exps:
+        - ads.example.com
+        - keyword:doubleclick
+        - keyword:googlesyndication
+
+  - tag: upstream
+    type: forward
+    args:
+      concurrent: 2
+      timeout: 4000
+      upstreams:
+        - addr: https://cloudflare-dns.com/dns-query
+          tag: cloudflare
+        - addr: https://dns.google/dns-query
+          tag: google
+        - addr: tls://1.1.1.1
+          tag: cloudflare-dot
+
+  - tag: main
+    type: sequence
+    args:
+      - matches:
+          - qname $ads
+        exec: reject NXDOMAIN
+      - exec: $hosts
+      - matches: has_resp
+        exec: accept
+      - exec: $cache
+      - matches: has_resp
+        exec: accept
+      - exec: $upstream
+
+servers:
+  - exec: main
+    timeout: 5
+    listeners:
+      - protocol: udp
+        addr: 0.0.0.0:53
+      - protocol: tcp
+        addr: 0.0.0.0:53

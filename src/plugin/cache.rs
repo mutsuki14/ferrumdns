@@ -1,0 +1,226 @@
+use async_trait::async_trait;
+use hickory_proto::op::ResponseCode;
+use parking_lot::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::context::QueryContext;
+use crate::dnsutil;
+use crate::error::Result;
+use crate::metrics::Metrics;
+use crate::plugin::{Action, Executable};
+
+struct Entry {
+    wire: Vec<u8>,
+    stored: Instant,
+    ttl_deadline: Instant,
+    expire: Instant,
+}
+
+struct Shard {
+    map: HashMap<String, Entry>,
+    lru: VecDeque<String>,
+    cap: usize,
+}
+
+impl Shard {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(cap.min(1024)),
+            lru: VecDeque::with_capacity(cap.min(1024)),
+            cap: cap.max(1),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<&Entry> {
+        if self.map.contains_key(key) {
+            if let Some(pos) = self.lru.iter().position(|k| k == key) {
+                if let Some(k) = self.lru.remove(pos) {
+                    self.lru.push_back(k);
+                }
+            }
+            self.map.get(key)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: String, entry: Entry) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key, entry);
+            return;
+        }
+        while self.map.len() >= self.cap {
+            if let Some(old) = self.lru.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.lru.push_back(key.clone());
+        self.map.insert(key, entry);
+    }
+
+    fn flush(&mut self) {
+        self.map.clear();
+        self.lru.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+pub struct Cache {
+    tag: String,
+    shards: Vec<Mutex<Shard>>,
+    lazy_ttl: Duration,
+    lazy_reply_ttl: u32,
+    cache_everything: bool,
+    metrics: Arc<Metrics>,
+}
+
+impl Cache {
+    pub fn from_args(tag: &str, args: &serde_yaml::Value, metrics: Arc<Metrics>) -> Arc<Self> {
+        let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(8192) as usize;
+        let n_shards = 16usize;
+        let per = (size / n_shards).max(32);
+        let shards = (0..n_shards).map(|_| Mutex::new(Shard::new(per))).collect();
+        let lazy = args
+            .get("lazy_cache_ttl")
+            .or_else(|| args.get("lazy_ttl"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let lazy_reply = args
+            .get("lazy_cache_reply_ttl")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as u32;
+        Arc::new(Self {
+            tag: tag.to_string(),
+            shards,
+            lazy_ttl: Duration::from_secs(lazy),
+            lazy_reply_ttl: lazy_reply.max(1),
+            cache_everything: args
+                .get("cache_everything")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            metrics,
+        })
+    }
+
+    fn shard(&self, key: &str) -> &Mutex<Shard> {
+        let mut h = 0u64;
+        for b in key.as_bytes() {
+            h = h.wrapping_mul(16777619) ^ *b as u64;
+        }
+        &self.shards[h as usize % self.shards.len()]
+    }
+
+    fn key_of(ctx: &QueryContext, everything: bool) -> Option<String> {
+        let q = ctx.query();
+        let simple = q.queries().len() == 1 && q.answers().is_empty() && q.name_servers().is_empty();
+        if !simple && !everything {
+            return None;
+        }
+        let q0 = q.queries().first()?;
+        Some(format!(
+            "{}|{:?}|{:?}",
+            dnsutil::name_ascii(q0.name()),
+            q0.query_type(),
+            q0.query_class()
+        ))
+    }
+
+    fn lookup(&self, key: &str) -> Option<(Vec<u8>, bool, Instant)> {
+        let mut shard = self.shard(key).lock();
+        let now = Instant::now();
+        let e = shard.get(key)?;
+        if now >= e.expire {
+            return None;
+        }
+        let lazy = now >= e.ttl_deadline && self.lazy_ttl > Duration::ZERO;
+        Some((e.wire.clone(), lazy, e.stored))
+    }
+
+    fn store(&self, key: String, ctx: &QueryContext) {
+        let Some(resp) = ctx.response() else {
+            return;
+        };
+        if resp.response_code() != ResponseCode::NoError || resp.truncated() {
+            return;
+        }
+        let Ok(wire) = dnsutil::encode(resp) else {
+            return;
+        };
+        let min = dnsutil::min_ttl(resp);
+        if min == 0 && self.lazy_ttl == Duration::ZERO {
+            return;
+        }
+        let now = Instant::now();
+        let ttl_deadline = now + Duration::from_secs(min.max(1) as u64);
+        let expire = if self.lazy_ttl > Duration::ZERO {
+            now + self.lazy_ttl
+        } else {
+            ttl_deadline
+        };
+        self.shard(&key).lock().insert(
+            key,
+            Entry {
+                wire,
+                stored: now,
+                ttl_deadline,
+                expire,
+            },
+        );
+    }
+
+    pub fn flush(&self) {
+        for s in &self.shards {
+            s.lock().flush();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().len()).sum()
+    }
+
+    pub fn maybe_store(&self, ctx: &QueryContext) {
+        if let Some(key) = Self::key_of(ctx, self.cache_everything) {
+            if ctx.has_resp() {
+                self.store(key, ctx);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Executable for Cache {
+    async fn exec(&self, ctx: &mut QueryContext) -> Result<Action> {
+        let Some(key) = Self::key_of(ctx, self.cache_everything) else {
+            return Ok(Action::Continue);
+        };
+
+        if let Some((wire, lazy, stored)) = self.lookup(&key) {
+            if let Ok(mut msg) = dnsutil::decode(&wire) {
+                let elapsed = Instant::now().saturating_duration_since(stored).as_secs() as u32;
+                if lazy {
+                    dnsutil::set_all_ttl(&mut msg, self.lazy_reply_ttl);
+                    self.metrics.cache_lazy_hits.fetch_add(1, Ordering::Relaxed);
+                    ctx.push_trace(&self.tag, "lazy_hit", &key);
+                } else {
+                    dnsutil::subtract_ttl(&mut msg, elapsed);
+                    ctx.push_trace(&self.tag, "hit", &key);
+                }
+                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                ctx.set_response(msg);
+                return Ok(Action::Continue);
+            }
+        }
+
+        self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+        ctx.push_trace(&self.tag, "miss", &key);
+        Ok(Action::Continue)
+    }
+}

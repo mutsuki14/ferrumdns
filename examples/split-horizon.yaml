@@ -1,0 +1,107 @@
+# Split-horizon: ads blocked, LAN hosts, CN domains via local DNS,
+# everything else via encrypted remote DNS, with fallback.
+log:
+  level: info
+
+api:
+  http: 127.0.0.1:9090
+
+plugins:
+  - tag: cache
+    type: cache
+    args:
+      size: 32768
+      lazy_cache_ttl: 86400
+
+  - tag: hosts
+    type: hosts
+    args:
+      files:
+        - ./hosts.txt
+
+  - tag: ads
+    type: domain_set
+    args:
+      files:
+        - ./rules/ads.txt
+
+  - tag: cn_domain
+    type: domain_set
+    args:
+      exps:
+        - domain:cn
+        - qq.com
+        - baidu.com
+        - aliyun.com
+        - bilibili.com
+
+  - tag: cn_ip
+    type: ip_set
+    args:
+      files:
+        - ./rules/cn-ip.txt
+
+  - tag: local
+    type: forward
+    args:
+      concurrent: 1
+      upstreams:
+        - addr: udp://223.5.5.5:53
+        - addr: udp://119.29.29.29:53
+
+  - tag: remote
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+        - addr: https://cloudflare-dns.com/dns-query
+        - addr: tls://8.8.8.8
+
+  - tag: local_seq
+    type: sequence
+    args:
+      - exec: $local
+      - matches:
+          - "!resp_ip $cn_ip"
+          - "!has_wanted_ans"
+        exec: drop_resp
+
+  - tag: remote_seq
+    type: sequence
+    args:
+      - exec: prefer_ipv4
+      - exec: $remote
+
+  - tag: fb
+    type: fallback
+    args:
+      primary: local_seq
+      secondary: remote_seq
+      threshold: 400
+      always_standby: true
+
+  - tag: main
+    type: sequence
+    args:
+      - matches: [qname $ads]
+        exec: reject NXDOMAIN
+      - exec: $hosts
+      - matches: has_resp
+        exec: accept
+      - exec: $cache
+      - matches: has_resp
+        exec: accept
+      - matches: [qname $cn_domain]
+        exec: $local
+      - matches: has_wanted_ans
+        exec: accept
+      - exec: $fb
+
+servers:
+  - exec: main
+    timeout: 6
+    listeners:
+      - protocol: udp
+        addr: "0.0.0.0:53"
+      - protocol: tcp
+        addr: "0.0.0.0:53"
