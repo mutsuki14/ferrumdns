@@ -117,7 +117,9 @@ async fn query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> std::re
                 .collect()
         })
         .unwrap_or_default();
-    let cache_hit = ctx.trace.iter().any(|t| t.event == "hit");
+    let cache_hit = ctx.trace.iter().any(|t| {
+        (t.event == "hit" || t.event == "lazy_hit") && st.rt.registry.caches.contains_key(&t.plugin)
+    });
     Ok(Json(QueryResp {
         rcode,
         answers,

@@ -1,12 +1,10 @@
-# Local / systemd example.
-# Binds :53 (needs root or CAP_NET_BIND_SERVICE) and the admin API on loopback.
-# Non-root dev:  examples/dev.yaml
-# Docker:        examples/docker.yaml
+# Image default. API is on 0.0.0.0:9090 so `docker run -p 9090:9090` reaches it.
+# DNS still binds :53 inside the container (map it with -p 53:53/udp -p 53:53/tcp).
 log:
   level: info
 
 api:
-  http: 127.0.0.1:9090
+  http: 0.0.0.0:9090
 
 plugins:
   - tag: hosts

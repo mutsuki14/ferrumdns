@@ -1,0 +1,4 @@
+# Local names for examples/split-horizon.yaml
+10.0.0.1 router.lan
+10.0.0.2 nas.lan
+10.0.0.10 app.lan

@@ -34,7 +34,7 @@ impl DomainSet {
         Self::default()
     }
 
-    pub fn from_args(args: &serde_yaml::Value) -> Result<Self> {
+    pub fn from_args(args: &serde_yaml::Value, base: &Path) -> Result<Self> {
         let mut set = Self::new();
         if let Some(exps) = args.get("exps").and_then(|v| v.as_sequence()) {
             for e in exps {
@@ -46,7 +46,7 @@ impl DomainSet {
         if let Some(files) = args.get("files").and_then(|v| v.as_sequence()) {
             for f in files {
                 if let Some(p) = f.as_str() {
-                    set.load_file(Path::new(p))?;
+                    set.load_file(&crate::config::resolve_path(base, p))?;
                 }
             }
         }
@@ -162,7 +162,7 @@ pub struct IpSet {
 }
 
 impl IpSet {
-    pub fn from_args(args: &serde_yaml::Value) -> Result<Self> {
+    pub fn from_args(args: &serde_yaml::Value, base: &Path) -> Result<Self> {
         let mut set = Self::default();
         if let Some(exps) = args.get("exps").and_then(|v| v.as_sequence()) {
             for e in exps {
@@ -174,7 +174,7 @@ impl IpSet {
         if let Some(files) = args.get("files").and_then(|v| v.as_sequence()) {
             for f in files {
                 if let Some(p) = f.as_str() {
-                    set.load_file(Path::new(p))?;
+                    set.load_file(&crate::config::resolve_path(base, p))?;
                 }
             }
         }

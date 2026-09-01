@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde_yaml::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
@@ -16,6 +16,10 @@ pub struct Config {
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub api: ApiConfig,
+    /// Directory of the file this config was loaded from. Relative `files:`
+    /// paths in plugins are resolved against it.
+    #[serde(skip)]
+    pub base_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,13 +43,15 @@ fn default_log_level() -> String {
     "info".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct PluginConfig {
     pub tag: Option<String>,
     #[serde(rename = "type")]
     pub ty: String,
     #[serde(default)]
     pub args: Value,
+    #[serde(skip)]
+    pub base_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +97,19 @@ pub struct ApiConfig {
     pub http: Option<String>,
 }
 
+/// Resolve a plugin `files:` entry. Absolute paths stay as-is; relative paths
+/// are joined to the config file's directory.
+pub fn resolve_path(base: &Path, p: &str) -> PathBuf {
+    let path = Path::new(p);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if base.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
 impl Config {
     pub fn from_yaml(text: &str) -> Result<Self> {
         let mut cfg: Config =
@@ -103,14 +122,27 @@ impl Config {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::config(format!("read {}: {e}", path.display())))?;
         let mut cfg = Self::from_yaml(&text)?;
-        let base = path.parent().unwrap_or(Path::new("."));
+        cfg.base_dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        cfg.stamp_base();
         let includes = cfg.include.clone();
         for rel in includes {
-            let p = base.join(rel);
+            let p = resolve_path(&cfg.base_dir, &rel);
             let extra = Self::load_file(&p)?;
             cfg.merge(extra);
         }
         Ok(cfg)
+    }
+
+    fn stamp_base(&mut self) {
+        for p in &mut self.plugins {
+            if p.base_dir.as_os_str().is_empty() {
+                p.base_dir = self.base_dir.clone();
+            }
+        }
     }
 
     fn merge(&mut self, other: Config) {
@@ -212,5 +244,13 @@ plugins:
         assert_eq!(cfg.servers.len(), 1);
         assert_eq!(cfg.servers[0].exec, "main");
         assert_eq!(cfg.servers[0].listeners[0].protocol, "udp");
+    }
+
+    #[test]
+    fn resolve_path_joins_relative() {
+        let p = resolve_path(Path::new("/etc/ferrumdns"), "./hosts.txt");
+        assert_eq!(p, PathBuf::from("/etc/ferrumdns/./hosts.txt"));
+        let abs = resolve_path(Path::new("/etc/ferrumdns"), "/var/lib/hosts");
+        assert_eq!(abs, PathBuf::from("/var/lib/hosts"));
     }
 }

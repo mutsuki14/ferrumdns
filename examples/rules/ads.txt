@@ -1,0 +1,6 @@
+# Demo ad / tracker domains. Replace with a real list in production.
+ads.example.com
+doubleclick.net
+googlesyndication.com
+keyword:tracker
+keyword:doubleclick

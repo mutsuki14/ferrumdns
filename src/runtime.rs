@@ -36,10 +36,10 @@ impl Runtime {
             let tag = p.tag.clone().unwrap_or_else(|| p.ty.clone());
             match p.ty.as_str() {
                 "domain_set" => {
-                    domains.insert(tag, sets::domain_set(&p.args)?);
+                    domains.insert(tag, sets::domain_set(&p.args, &p.base_dir)?);
                 }
                 "ip_set" => {
-                    ips.insert(tag, sets::ip_set(&p.args)?);
+                    ips.insert(tag, sets::ip_set(&p.args, &p.base_dir)?);
                 }
                 "cache" => {
                     let c = Cache::from_args(&tag, &p.args, metrics.clone());
@@ -47,7 +47,7 @@ impl Runtime {
                     execs.insert(tag, c);
                 }
                 "hosts" => {
-                    execs.insert(tag.clone(), Hosts::from_args(&tag, &p.args)?);
+                    execs.insert(tag.clone(), Hosts::from_args(&tag, &p.args, &p.base_dir)?);
                 }
                 "forward" | "fast_forward" => {
                     execs.insert(

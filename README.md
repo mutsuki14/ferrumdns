@@ -24,34 +24,91 @@ FerrumDNS 是一个用 **Rust** 编写的高性能 DNS 转发器。配置模型�
 
 ## Install
 
-```bash
-# from source
-cargo install --path . --locked
+Requires a Rust toolchain (1.80+, via [rustup](https://rustup.rs)). Clone the repo, then pick **one** install path.
 
-# or build a release binary
-cargo build --release
-sudo install -m 0755 target/release/ferrumdns /usr/local/bin/
+```bash
+git clone https://github.com/mutsuki14/ferrumdns.git
+cd ferrumdns
 ```
 
-Drop `examples/simple.yaml` at `/etc/ferrumdns/config.yaml`, then:
+### A. System binary (bind `:53`)
 
 ```bash
+cargo build --release
+sudo install -m 0755 target/release/ferrumdns /usr/local/bin/ferrumdns
+sudo mkdir -p /etc/ferrumdns
+sudo cp examples/simple.yaml /etc/ferrumdns/config.yaml
 ferrumdns check -c /etc/ferrumdns/config.yaml
 sudo ferrumdns start -c /etc/ferrumdns/config.yaml
 ```
 
-Docker:
+`:53` needs root or `CAP_NET_BIND_SERVICE` (the [systemd unit](systemd/ferrumdns.service) already sets the capability). Query it with:
+
+```bash
+dig @127.0.0.1 router.lan
+curl -s http://127.0.0.1:9090/api/stats
+```
+
+### B. User install, high port (no root)
+
+`cargo install` puts the binary in `~/.cargo/bin`. Put that directory on your `PATH`. **Do not** run it via `sudo` — sudo's PATH does not include `~/.cargo/bin`.
+
+```bash
+cargo install --path . --locked
+ferrumdns check -c examples/dev.yaml
+ferrumdns start -c examples/dev.yaml
+```
+
+```bash
+dig @127.0.0.1 -p 5353 router.lan
+curl -s http://127.0.0.1:9090/api/stats
+```
+
+### Docker
+
+The image already contains `examples/docker.yaml` (API on `0.0.0.0:9090` so published port 9090 is reachable). Do **not** mount a host path that does not exist — Docker will create a directory there and the process will fail to read the config.
 
 ```bash
 docker build -t ferrumdns .
-docker run --rm -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
-  -v $PWD/config.yaml:/etc/ferrumdns/config.yaml \
+docker run --rm --name ferrumdns \
+  -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
   ferrumdns
 ```
 
-Without root, bind a high port (`0.0.0.0:5353`) instead of `:53`.
+To override the baked-in config, pass a file that already exists:
+
+```bash
+docker run --rm --name ferrumdns \
+  -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
+  -v "$PWD/examples/docker.yaml:/etc/ferrumdns/config.yaml:ro" \
+  ferrumdns
+```
+
+### systemd
+
+```bash
+sudo mkdir -p /etc/ferrumdns
+sudo cp examples/simple.yaml /etc/ferrumdns/config.yaml
+sudo install -m 0755 target/release/ferrumdns /usr/local/bin/ferrumdns
+sudo cp systemd/ferrumdns.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ferrumdns
+```
 
 ## Quick start
+
+Checked-in configs:
+
+| File | Bind | API | Use |
+|---|---|---|---|
+| [`examples/simple.yaml`](examples/simple.yaml) | `0.0.0.0:53` | `127.0.0.1:9090` | local / systemd |
+| [`examples/dev.yaml`](examples/dev.yaml) | `127.0.0.1:5353` | `127.0.0.1:9090` | `cargo run`, no root |
+| [`examples/docker.yaml`](examples/docker.yaml) | `0.0.0.0:53` | `0.0.0.0:9090` | container |
+| [`examples/split-horizon.yaml`](examples/split-horizon.yaml) | `0.0.0.0:53` | `127.0.0.1:9090` | ads + CN split + fallback |
+
+`files:` paths inside a YAML file are resolved relative to that file, so `ferrumdns check -c examples/split-horizon.yaml` works from the repo root.
+
+Minimal pipeline (same shape as `examples/simple.yaml`):
 
 ```yaml
 log:
@@ -105,20 +162,15 @@ plugins:
   - type: udp_server
     args:
       entry: main
-      listen: 0.0.0.0:53
+      listen: 127.0.0.1:5353
 
   - type: tcp_server
     args:
       entry: main
-      listen: 0.0.0.0:53
+      listen: 127.0.0.1:5353
 ```
 
-Point a client at it:
-
-```bash
-dig @127.0.0.1 router.lan
-curl -s http://127.0.0.1:9090/api/stats
-```
+Save that as `config.yaml` and run `ferrumdns check -c config.yaml && ferrumdns start -c config.yaml`.
 
 ## Architecture
 
@@ -183,6 +235,8 @@ Bind with `api.http`. Endpoints:
 
 FerrumDNS accepts **mosdns v5-style** plugin lists (`matches` / `exec` / `$tag`) and **mosdns-x-style** `servers:` + `listeners`. Not every mosdns-x plugin is implemented (no nftset, no DoQ/DoH3 yet). The goal is a drop-in subset for the forwarding / split-horizon / ad-block setups people actually run.
 
+Relative `files:` entries (`hosts`, `domain_set`, `ip_set`) and `include:` are resolved against the config file's directory.
+
 ## Performance notes
 
 - Multi-thread tokio runtime, `SO_REUSEPORT` on UDP
@@ -194,9 +248,16 @@ FerrumDNS accepts **mosdns v5-style** plugin lists (`matches` / `exec` / `$tag`)
 ## Development
 
 ```bash
-cargo test
-cargo run -- start -c examples/simple.yaml
+cargo test --all
+cargo run -- start -c examples/dev.yaml
+dig @127.0.0.1 -p 5353 router.lan
+curl -s http://127.0.0.1:9090/api/stats
+curl -s -X POST http://127.0.0.1:9090/api/query \
+  -H 'content-type: application/json' \
+  -d '{"name":"router.lan","qtype":"A"}'
 ```
+
+`examples/dev.yaml` binds `127.0.0.1:5353` so this does not need root. `examples/simple.yaml` binds `:53` and will fail with `permission denied` as a normal user.
 
 ## License
 

@@ -30,7 +30,7 @@ pub struct Hosts {
 }
 
 impl Hosts {
-    pub fn from_args(tag: &str, args: &serde_yaml::Value) -> Result<Arc<Self>> {
+    pub fn from_args(tag: &str, args: &serde_yaml::Value, base: &Path) -> Result<Arc<Self>> {
         let mut table = HostTable::default();
         let ttl = args.get("ttl").and_then(|v| v.as_u64()).unwrap_or(60) as u32;
         if let Some(entries) = args.get("entries").and_then(|v| v.as_sequence()) {
@@ -43,7 +43,7 @@ impl Hosts {
         if let Some(files) = args.get("files").and_then(|v| v.as_sequence()) {
             for f in files {
                 if let Some(p) = f.as_str() {
-                    load_file(&mut table, Path::new(p))?;
+                    load_file(&mut table, &crate::config::resolve_path(base, p))?;
                 }
             }
         }
@@ -156,7 +156,7 @@ entries:
 "#,
         )
         .unwrap();
-        let h = Hosts::from_args("hosts", &args).unwrap();
+        let h = Hosts::from_args("hosts", &args, Path::new(".")).unwrap();
         let q = build_query("router.lan.", RecordType::A).unwrap();
         let mut ctx = QueryContext::new(q, None, ClientProto::Udp);
         tokio::runtime::Runtime::new()

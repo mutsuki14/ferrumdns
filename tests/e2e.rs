@@ -92,8 +92,25 @@ plugins:
     rt.handle_query(&mut ctx2, "main").await.unwrap();
     assert!(ctx2.has_resp());
     assert!(
-        ctx2.trace.iter().any(|t| t.event == "hit"),
+        ctx2.trace.iter().any(|t| t.event == "hit" && t.plugin == "cache"),
         "expected cache hit, trace={:?}",
         ctx2.trace
     );
+}
+
+#[tokio::test]
+async fn example_configs_build() {
+    use std::path::Path;
+    for file in [
+        "examples/simple.yaml",
+        "examples/dev.yaml",
+        "examples/docker.yaml",
+        "examples/split-horizon.yaml",
+    ] {
+        let cfg = Config::load_file(Path::new(file))
+            .unwrap_or_else(|e| panic!("load {file}: {e}"));
+        Runtime::build(cfg)
+            .await
+            .unwrap_or_else(|e| panic!("build {file}: {e}"));
+    }
 }

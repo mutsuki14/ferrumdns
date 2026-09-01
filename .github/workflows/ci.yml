@@ -17,5 +17,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: test
         run: cargo test --all
-      - name: check example config
-        run: cargo run --quiet -- check -c examples/simple.yaml
+      - name: check example configs
+        run: |
+          cargo run --quiet -- check -c examples/simple.yaml
+          cargo run --quiet -- check -c examples/dev.yaml
+          cargo run --quiet -- check -c examples/docker.yaml
+          cargo run --quiet -- check -c examples/split-horizon.yaml

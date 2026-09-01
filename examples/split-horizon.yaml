@@ -1,5 +1,8 @@
 # Split-horizon: ads blocked, LAN hosts, CN domains via local DNS,
 # everything else via encrypted remote DNS, with fallback.
+#
+# Relative `files:` paths are resolved from this file's directory, so
+# `ferrumdns check -c examples/split-horizon.yaml` works from the repo root.
 log:
   level: info
 
