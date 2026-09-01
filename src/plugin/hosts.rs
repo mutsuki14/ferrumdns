@@ -89,6 +89,10 @@ impl Hosts {
             })
             .collect()
     }
+    fn known_name(&self, name: &str) -> bool {
+        let key = name.trim_end_matches('.').to_ascii_lowercase();
+        self.table.read().by_name.contains_key(&key)
+    }
 }
 
 fn load_file(table: &mut HostTable, path: &Path) -> Result<()> {
@@ -136,6 +140,10 @@ impl Executable for Hosts {
         if !recs.is_empty() {
             ctx.push_trace(&self.tag, "hit", &name);
             ctx.set_response(build_hosts_response(ctx.query(), recs));
+        } else if self.known_name(&name) {
+            // Name is local but this type has no records — NODATA, do not leak to upstream.
+            ctx.push_trace(&self.tag, "nodata", &name);
+            ctx.set_response(build_hosts_response(ctx.query(), Vec::new()));
         }
         Ok(Action::Continue)
     }
@@ -165,5 +173,48 @@ entries:
             .unwrap();
         assert!(ctx.has_resp());
         assert_eq!(ctx.answer_ips()[0], "10.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn hosts_aaaa_is_nodata_not_miss() {
+        let args: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+entries:
+  - "10.0.0.1 router.lan"
+"#,
+        )
+        .unwrap();
+        let h = Hosts::from_args("hosts", &args, Path::new(".")).unwrap();
+        let q = build_query("router.lan.", RecordType::AAAA).unwrap();
+        let mut ctx = QueryContext::new(q, None, ClientProto::Udp);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(h.exec(&mut ctx))
+            .unwrap();
+        assert!(ctx.has_resp());
+        assert!(ctx.answer_ips().is_empty());
+        assert_eq!(
+            ctx.response().unwrap().response_code(),
+            hickory_proto::op::ResponseCode::NoError
+        );
+    }
+
+    #[test]
+    fn unknown_name_is_miss() {
+        let args: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+entries:
+  - "10.0.0.1 router.lan"
+"#,
+        )
+        .unwrap();
+        let h = Hosts::from_args("hosts", &args, Path::new(".")).unwrap();
+        let q = build_query("other.lan.", RecordType::A).unwrap();
+        let mut ctx = QueryContext::new(q, None, ClientProto::Udp);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(h.exec(&mut ctx))
+            .unwrap();
+        assert!(!ctx.has_resp());
     }
 }

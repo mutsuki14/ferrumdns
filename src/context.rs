@@ -86,6 +86,7 @@ impl QueryContext {
 
     pub fn set_response(&mut self, mut msg: Message) {
         msg.set_id(self.query.id());
+        msg.set_message_type(MessageType::Response);
         self.response = Some(msg);
     }
 

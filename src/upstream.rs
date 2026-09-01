@@ -138,7 +138,7 @@ impl Upstream {
         };
 
         let tls = if matches!(kind, Kind::Tls { .. }) {
-            Some(build_tls_connector()?)
+            Some(build_tls_connector(spec.insecure)?)
         } else {
             None
         };
@@ -193,9 +193,20 @@ fn split_scheme(addr: &str) -> (&str, &str) {
 }
 
 fn host_of(rest: &str) -> String {
-    let rest = rest.trim_start_matches('[');
-    let host = rest.split(['/', ':', ']']).next().unwrap_or(rest);
-    host.to_string()
+    let rest = rest.split('/').next().unwrap_or(rest);
+    if let Some(inner) = rest.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner).to_string()
+    } else if rest.parse::<std::net::Ipv6Addr>().is_ok() {
+        rest.to_string()
+    } else if let Some((h, p)) = rest.rsplit_once(':') {
+        if p.parse::<u16>().is_ok() {
+            h.to_string()
+        } else {
+            rest.to_string()
+        }
+    } else {
+        rest.to_string()
+    }
 }
 
 fn normalize_hostport(rest: &str, default_port: u16) -> String {
@@ -206,6 +217,8 @@ fn normalize_hostport(rest: &str, default_port: u16) -> String {
         } else {
             format!("{rest}:{default_port}")
         }
+    } else if rest.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{rest}]:{default_port}")
     } else if rest.chars().filter(|c| *c == ':').count() == 1 {
         rest.to_string()
     } else {
@@ -232,9 +245,16 @@ async fn udp_exchange(target: &str, q: &Message) -> Result<Message> {
     let sock = UdpSocket::bind(bind).await?;
     let bytes = dnsutil::encode(q)?;
     sock.send_to(&bytes, dest).await?;
-    let mut buf = vec![0u8; 4096];
-    let (n, _) = sock.recv_from(&mut buf).await?;
-    dnsutil::decode(&buf[..n])
+    let mut buf = vec![0u8; 65535];
+    // A late/spoofed packet may not match our ID; wait for the right one a few times.
+    for _ in 0..4 {
+        let (n, _) = sock.recv_from(&mut buf).await?;
+        let resp = dnsutil::decode(&buf[..n])?;
+        if let Ok(ok) = dnsutil::take_response(q, resp) {
+            return Ok(ok);
+        }
+    }
+    Err(Error::protocol("no matching udp response"))
 }
 
 async fn tcp_exchange(target: &str, q: &Message) -> Result<Message> {
@@ -242,7 +262,8 @@ async fn tcp_exchange(target: &str, q: &Message) -> Result<Message> {
     let mut stream = TcpStream::connect(dest).await?;
     stream.set_nodelay(true)?;
     write_framed(&mut stream, q).await?;
-    read_framed(&mut stream).await
+    let resp = read_framed(&mut stream).await?;
+    dnsutil::take_response(q, resp)
 }
 
 async fn tls_exchange(
@@ -261,7 +282,8 @@ async fn tls_exchange(
         .await
         .map_err(|e| Error::protocol(e.to_string()))?;
     write_framed(&mut tls, q).await?;
-    read_framed(&mut tls).await
+    let resp = read_framed(&mut tls).await?;
+    dnsutil::take_response(q, resp)
 }
 
 async fn doh_exchange(client: &reqwest::Client, url: &str, q: &Message) -> Result<Message> {
@@ -281,7 +303,7 @@ async fn doh_exchange(client: &reqwest::Client, url: &str, q: &Message) -> Resul
         .bytes()
         .await
         .map_err(|e| Error::protocol(e.to_string()))?;
-    dnsutil::decode(&body)
+    dnsutil::take_response(q, dnsutil::decode(&body)?)
 }
 
 async fn write_framed<S: AsyncWriteExt + Unpin>(s: &mut S, q: &Message) -> Result<()> {
@@ -305,12 +327,93 @@ async fn read_framed<S: AsyncReadExt + Unpin>(s: &mut S) -> Result<Message> {
     dnsutil::decode(&buf)
 }
 
-fn build_tls_connector() -> Result<TlsConnector> {
+fn build_tls_connector(insecure: bool) -> Result<TlsConnector> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let cfg = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let cfg = if insecure {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth()
+    } else {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
     Ok(TlsConnector::from(Arc::new(cfg)))
+}
+
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_of_ipv6_and_hostport() {
+        assert_eq!(host_of("[2606:4700:4700::1111]:853"), "2606:4700:4700::1111");
+        assert_eq!(host_of("2606:4700:4700::1111"), "2606:4700:4700::1111");
+        assert_eq!(host_of("1.1.1.1:853"), "1.1.1.1");
+        assert_eq!(host_of("dns.google"), "dns.google");
+        assert_eq!(host_of("dns.google:853"), "dns.google");
+        assert_eq!(
+            normalize_hostport("2606:4700:4700::1111", 853),
+            "[2606:4700:4700::1111]:853"
+        );
+        assert_eq!(
+            normalize_hostport("[2606:4700:4700::1111]", 853),
+            "[2606:4700:4700::1111]:853"
+        );
+        assert_eq!(normalize_hostport("1.1.1.1", 853), "1.1.1.1:853");
+        assert_eq!(normalize_hostport("1.1.1.1:853", 853), "1.1.1.1:853");
+    }
 }

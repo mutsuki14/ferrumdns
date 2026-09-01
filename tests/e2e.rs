@@ -58,6 +58,16 @@ async fn hosts_and_adblock() {
         hickory_proto::op::ResponseCode::NXDomain,
         ctx.response().unwrap().response_code()
     );
+
+    let q = build_query("box.test.", RecordType::AAAA).unwrap();
+    let mut ctx = QueryContext::new(q, None, ClientProto::Udp);
+    rt.handle_query(&mut ctx, "main").await.unwrap();
+    assert!(ctx.has_resp(), "AAAA for a hosts name must not miss");
+    assert!(ctx.answer_ips().is_empty());
+    assert_eq!(
+        hickory_proto::op::ResponseCode::NoError,
+        ctx.response().unwrap().response_code()
+    );
 }
 
 #[tokio::test]

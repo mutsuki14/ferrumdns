@@ -66,14 +66,13 @@ plugins:
       - exec: $local
       - matches:
           - "!resp_ip $cn_ip"
-          - "!has_wanted_ans"
         exec: drop_resp
 
   - tag: remote_seq
     type: sequence
     args:
-      - exec: prefer_ipv4
       - exec: $remote
+      - exec: prefer_ipv4
 
   - tag: fb
     type: fallback

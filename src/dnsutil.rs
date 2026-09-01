@@ -1,4 +1,4 @@
-use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -10,6 +10,69 @@ pub fn decode(buf: &[u8]) -> Result<Message> {
 
 pub fn encode(msg: &Message) -> Result<Vec<u8>> {
     msg.to_vec().map_err(|e| Error::protocol(e.to_string()))
+}
+
+/// How to treat a packet received on a listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Incoming {
+    /// Already a response (or garbage) — do not reply (avoids amplification).
+    Drop,
+    /// Unsupported opcode — reply NOTIMP.
+    NotImp,
+    Ok,
+}
+
+pub fn classify_incoming(msg: &Message) -> Incoming {
+    if msg.message_type() != MessageType::Query {
+        Incoming::Drop
+    } else if msg.op_code() != OpCode::Query {
+        Incoming::NotImp
+    } else {
+        Incoming::Ok
+    }
+}
+
+pub fn take_response(query: &Message, resp: Message) -> Result<Message> {
+    if resp.message_type() != MessageType::Response {
+        return Err(Error::protocol("upstream sent a query"));
+    }
+    if resp.id() != query.id() {
+        return Err(Error::protocol("id mismatch"));
+    }
+    Ok(resp)
+}
+
+/// A response that should win a `concurrent` race. SERVFAIL/FORMERR from one
+/// upstream must not beat a slower NOERROR from another.
+pub fn is_usable_response(msg: &Message) -> bool {
+    msg.message_type() == MessageType::Response
+        && !matches!(
+            msg.response_code(),
+            ResponseCode::ServFail | ResponseCode::FormErr | ResponseCode::NotImp
+        )
+}
+
+pub fn udp_payload_max(query: &Message) -> usize {
+    query
+        .extensions()
+        .as_ref()
+        .map(|e| e.max_payload() as usize)
+        .filter(|&n| n >= 512)
+        .unwrap_or(512)
+        .min(4096)
+}
+
+pub fn encode_udp(msg: &Message, max_len: usize) -> Result<Vec<u8>> {
+    let bytes = encode(msg)?;
+    if bytes.len() <= max_len {
+        return Ok(bytes);
+    }
+    let mut truncated = msg.clone();
+    truncated.set_truncated(true);
+    truncated.answers_mut().clear();
+    truncated.name_servers_mut().clear();
+    truncated.additionals_mut().clear();
+    encode(&truncated)
 }
 
 pub fn reply_skeleton(query: &Message, rcode: ResponseCode) -> Message {
@@ -137,5 +200,35 @@ mod tests {
         let back = decode(&bytes).unwrap();
         assert_eq!(back.queries()[0].name(), q.queries()[0].name());
         assert_eq!(back.queries()[0].query_type(), RecordType::A);
+    }
+
+    #[test]
+    fn drops_response_packets() {
+        let mut msg = build_query("example.com.", RecordType::A).unwrap();
+        assert_eq!(classify_incoming(&msg), Incoming::Ok);
+        msg.set_message_type(MessageType::Response);
+        assert_eq!(classify_incoming(&msg), Incoming::Drop);
+        let mut upd = build_query("example.com.", RecordType::A).unwrap();
+        upd.set_op_code(OpCode::Update);
+        assert_eq!(classify_incoming(&upd), Incoming::NotImp);
+    }
+
+    #[test]
+    fn take_response_checks_id_and_qr() {
+        let q = build_query("example.com.", RecordType::A).unwrap();
+        let mut r = reply_skeleton(&q, ResponseCode::NoError);
+        r.set_id(q.id());
+        assert!(take_response(&q, r.clone()).is_ok());
+        r.set_id(q.id().wrapping_add(1));
+        assert!(take_response(&q, r).is_err());
+    }
+
+    #[test]
+    fn usable_skips_servfail() {
+        let q = build_query("example.com.", RecordType::A).unwrap();
+        let sf = reply_skeleton(&q, ResponseCode::ServFail);
+        let nx = reply_skeleton(&q, ResponseCode::NXDomain);
+        assert!(!is_usable_response(&sf));
+        assert!(is_usable_response(&nx));
     }
 }

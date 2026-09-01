@@ -6,7 +6,6 @@ use axum::Router;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use crate::context::{build_query, ClientProto, QueryContext, TraceEvent};
 use crate::dnsutil;
@@ -134,9 +133,4 @@ async fn flush(State(st): State<AppState>) -> Json<serde_json::Value> {
         c.flush();
     }
     Json(serde_json::json!({ "ok": true }))
-}
-
-#[allow(dead_code)]
-fn _use_ordering() {
-    let _ = Ordering::Relaxed;
 }

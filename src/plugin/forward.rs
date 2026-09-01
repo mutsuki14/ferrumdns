@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::context::QueryContext;
+use crate::dnsutil;
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 use crate::plugin::{Action, Executable};
@@ -45,11 +46,18 @@ impl Forward {
             .and_then(|v| v.as_u64())
             .unwrap_or(1)
             .max(1) as usize;
-        let timeout = Duration::from_millis(
-            args.get("timeout")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5000),
-        );
+        let timeout_raw = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5000);
+        if timeout_raw > 0 && timeout_raw < 50 {
+            tracing::warn!(
+                plugin = %tag,
+                timeout_ms = timeout_raw,
+                "forward `timeout` is milliseconds (5 means 5ms, not 5s)"
+            );
+        }
+        let timeout = Duration::from_millis(timeout_raw.max(1));
         Ok(Arc::new(Self {
             tag: tag.to_string(),
             upstreams,
@@ -68,9 +76,14 @@ impl Executable for Forward {
 
         if n == 1 {
             match self.upstreams[0].exchange(&q, self.timeout).await {
-                Ok(msg) => {
+                Ok(msg) if dnsutil::is_usable_response(&msg) => {
                     self.metrics.upstream_ok.fetch_add(1, Ordering::Relaxed);
                     ctx.push_trace(&self.tag, "ok", self.upstreams[0].label());
+                    ctx.set_response(msg);
+                }
+                Ok(msg) => {
+                    self.metrics.upstream_err.fetch_add(1, Ordering::Relaxed);
+                    ctx.push_trace(&self.tag, "err", "unusable rcode");
                     ctx.set_response(msg);
                 }
                 Err(e) => {
@@ -96,19 +109,28 @@ impl Executable for Forward {
         drop(tx);
 
         let mut last_err: Option<String> = None;
+        let mut last_unusable: Option<hickory_proto::op::Message> = None;
         while let Some((i, r)) = rx.recv().await {
             match r {
-                Ok(msg) => {
+                Ok(msg) if dnsutil::is_usable_response(&msg) => {
                     self.metrics.upstream_ok.fetch_add(1, Ordering::Relaxed);
                     ctx.push_trace(&self.tag, "ok", self.upstreams[i].label());
                     ctx.set_response(msg);
                     return Ok(Action::Continue);
+                }
+                Ok(msg) => {
+                    self.metrics.upstream_err.fetch_add(1, Ordering::Relaxed);
+                    last_err = Some(format!("{} unusable rcode", self.upstreams[i].label()));
+                    last_unusable = Some(msg);
                 }
                 Err(e) => {
                     self.metrics.upstream_err.fetch_add(1, Ordering::Relaxed);
                     last_err = Some(e.to_string());
                 }
             }
+        }
+        if let Some(msg) = last_unusable {
+            ctx.set_response(msg);
         }
         ctx.push_trace(
             &self.tag,

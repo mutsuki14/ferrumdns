@@ -17,7 +17,7 @@ FerrumDNS 是一个用 **Rust** 编写的高性能 DNS 转发器。配置模型�
 |---|---|---|
 | Runtime | GC | zero-GC, tokio |
 | Pipeline | plugin sequence | plugin sequence (compatible YAML) |
-| Listen | UDP / TCP / DoT / DoH / DoQ / DoH3 | UDP / TCP / DoT / DoH |
+| Listen | UDP / TCP / DoT / DoH / DoQ / DoH3 | UDP / TCP / DoT / DoH (DoH listener is HTTP; terminate TLS in front) |
 | Upstream | UDP / TCP / DoT / DoH / DoQ / DoH3 | UDP / TCP / DoT / DoH |
 | Cache | sharded LRU + lazy TTL | sharded LRU + lazy TTL |
 | Admin | HTTP + Prometheus | HTTP JSON + Prometheus |

@@ -49,7 +49,11 @@ impl Shard {
 
     fn insert(&mut self, key: String, entry: Entry) {
         if self.map.contains_key(&key) {
-            self.map.insert(key, entry);
+            self.map.insert(key.clone(), entry);
+            if let Some(pos) = self.lru.iter().position(|k| k == &key) {
+                self.lru.remove(pos);
+            }
+            self.lru.push_back(key);
             return;
         }
         while self.map.len() >= self.cap {
@@ -222,5 +226,30 @@ impl Executable for Cache {
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
         ctx.push_trace(&self.tag, "miss", &key);
         Ok(Action::Continue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_promotes_lru() {
+        let mut s = Shard::new(2);
+        let now = Instant::now();
+        let mk = |wire: u8| Entry {
+            wire: vec![wire],
+            stored: now,
+            ttl_deadline: now + Duration::from_secs(10),
+            expire: now + Duration::from_secs(10),
+        };
+        s.insert("a".into(), mk(1));
+        s.insert("b".into(), mk(2));
+        s.insert("a".into(), mk(3)); // promote a
+        s.insert("c".into(), mk(4)); // should evict b, not a
+        assert!(s.map.contains_key("a"));
+        assert!(s.map.contains_key("c"));
+        assert!(!s.map.contains_key("b"));
+        assert_eq!(s.map["a"].wire, vec![3]);
     }
 }
