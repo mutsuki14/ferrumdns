@@ -3,6 +3,7 @@
 [**English**](README.md) | [简体中文](README.zh-CN.md)
 
 [![ci](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml/badge.svg)](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/mutsuki14/ferrumdns?style=flat-square)](https://github.com/mutsuki14/ferrumdns/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-steelblue.svg?style=flat-square)](LICENSE)
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 
@@ -44,7 +45,7 @@ Inspired by [mosdns-x](https://github.com/pmkol/mosdns-x) — same mental model 
 
 FerrumDNS is a LAN / homelab / OpenWrt-class forwarder. The pipeline is mosdns-compatible YAML: plugins tagged and wired through a `sequence` of `matches` + `exec`.
 
-v0.1. Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, UDP `SO_REUSEPORT` workers, TCP/DoT connection reuse, SIGHUP plugin reload, EDNS Client Subnet. Planned: DoQ, DoH3, geosite/geoip dat.
+v0.1.0 is the first tagged release. Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, UDP `SO_REUSEPORT` workers, TCP/DoT connection reuse, SIGHUP plugin reload, EDNS Client Subnet. Planned: DoQ, DoH3, geosite/geoip dat.
 
 | | mosdns-x (Go) | FerrumDNS (Rust) |
 |---|---|---|
@@ -59,7 +60,7 @@ v0.1. Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, 
 
 ## Install
 
-Requires a Rust toolchain (1.80+, via [rustup](https://rustup.rs)). Clone the repo, then pick **one** path.
+Download a binary from [GitHub Releases](https://github.com/mutsuki14/ferrumdns/releases/latest), or build from source (Rust 1.80+, via [rustup](https://rustup.rs)). Clone the repo, then pick **one** path.
 
 ```sh
 git clone https://github.com/mutsuki14/ferrumdns.git

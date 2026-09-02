@@ -271,6 +271,9 @@ async fn write_tcp_response<S: AsyncWriteExt + Unpin>(
         return Ok(());
     };
     let bytes = dnsutil::encode(resp)?;
+    if bytes.len() > u16::MAX as usize {
+        return Err(Error::protocol("tcp payload too large"));
+    }
     let n = bytes.len() as u16;
     tokio::time::timeout(idle, async {
         stream.write_all(&n.to_be_bytes()).await?;

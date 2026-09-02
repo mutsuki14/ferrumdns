@@ -64,8 +64,8 @@ impl Executable for BoundFallback {
         let secondary = self.reg.get_exec(&f.secondary)?;
 
         if f.always_standby {
-            let mut pctx = ctx.clone_for_lazy();
-            let mut sctx = ctx.clone_for_lazy();
+            let mut pctx = ctx.fork();
+            let mut sctx = ctx.fork();
             let p = primary.clone();
             let s = secondary.clone();
             let thresh = f.threshold;

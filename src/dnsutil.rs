@@ -49,7 +49,10 @@ pub fn is_usable_response(msg: &Message) -> bool {
     msg.message_type() == MessageType::Response
         && !matches!(
             msg.response_code(),
-            ResponseCode::ServFail | ResponseCode::FormErr | ResponseCode::NotImp
+            ResponseCode::ServFail
+                | ResponseCode::FormErr
+                | ResponseCode::NotImp
+                | ResponseCode::Refused
         )
 }
 
@@ -68,12 +71,7 @@ pub fn encode_udp(msg: &Message, max_len: usize) -> Result<Vec<u8>> {
     if bytes.len() <= max_len {
         return Ok(bytes);
     }
-    let mut truncated = msg.clone();
-    truncated.set_truncated(true);
-    truncated.answers_mut().clear();
-    truncated.name_servers_mut().clear();
-    truncated.additionals_mut().clear();
-    encode(&truncated)
+    encode(&msg.truncate())
 }
 
 pub fn reply_skeleton(query: &Message, rcode: ResponseCode) -> Message {
@@ -105,6 +103,10 @@ pub fn min_ttl(msg: &Message) -> u32 {
 pub fn subtract_ttl(msg: &mut Message, elapsed: u32) {
     let bump = |recs: &mut [Record]| {
         for r in recs {
+            // OPT CLASS/TTL are EDNS payload size + flags, not a TTL.
+            if r.record_type() == RecordType::OPT {
+                continue;
+            }
             let ttl = r.ttl().saturating_sub(elapsed);
             r.set_ttl(ttl);
         }
@@ -289,8 +291,52 @@ mod tests {
         m.set_message_type(MessageType::Response);
         m.set_response_code(ResponseCode::ServFail);
         assert!(!is_usable_response(&m));
+        m.set_response_code(ResponseCode::Refused);
+        assert!(!is_usable_response(&m));
+        m.set_response_code(ResponseCode::NXDomain);
+        assert!(is_usable_response(&m));
         m.set_response_code(ResponseCode::NoError);
         assert!(is_usable_response(&m));
+    }
+
+    #[test]
+    fn subtract_ttl_leaves_edns_flags_alone() {
+        let mut m = Message::new();
+        m.set_id(1);
+        m.set_message_type(MessageType::Response);
+        let n = Name::from_ascii("example.com.").unwrap();
+        m.add_answer(record_a(n, 30, Ipv4Addr::new(1, 2, 3, 4)));
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        edns.set_max_payload(1232);
+        m.set_edns(edns);
+        subtract_ttl(&mut m, 5);
+        assert_eq!(m.answers()[0].ttl(), 25);
+        assert!(
+            m.extensions().as_ref().unwrap().flags().dnssec_ok,
+            "EDNS DO lives in extensions, must survive TTL decay"
+        );
+    }
+
+    #[test]
+    fn encode_udp_truncation_keeps_opt() {
+        let mut m = Message::new();
+        m.set_id(9);
+        m.set_message_type(MessageType::Response);
+        m.set_op_code(OpCode::Query);
+        let n = Name::from_ascii("pad.example.com.").unwrap();
+        for i in 0..40 {
+            m.add_answer(record_a(n.clone(), 60, Ipv4Addr::new(10, 0, i, 1)));
+        }
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        m.set_edns(edns);
+        let bytes = encode_udp(&m, 512).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert!(back.truncated());
+        assert!(back.answers().is_empty());
+        assert!(ecs_of(&back).is_none());
+        assert!(back.extensions().is_some());
     }
 
     #[test]

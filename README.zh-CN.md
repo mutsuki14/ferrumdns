@@ -3,6 +3,7 @@
 [English](README.md) | [**简体中文**](README.zh-CN.md)
 
 [![ci](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml/badge.svg)](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/mutsuki14/ferrumdns?style=flat-square)](https://github.com/mutsuki14/ferrumdns/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-steelblue.svg?style=flat-square)](LICENSE)
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 
@@ -44,7 +45,7 @@
 
 FerrumDNS 面向局域网 / 家庭实验室 / OpenWrt 级转发。流水线是 mosdns 兼容的 YAML：插件用 tag 引用，经 `sequence` 的 `matches` + `exec` 串联。
 
-v0.1。已交付：lazy 缓存后台刷新、bootstrap DNS、DoH TLS 监听、UDP `SO_REUSEPORT` worker、TCP/DoT 连接复用、SIGHUP 热加载、EDNS Client Subnet。规划中：DoQ、DoH3、geosite/geoip dat。
+v0.1.0 是第一个 tagged release。已交付：lazy 缓存后台刷新、bootstrap DNS、DoH TLS 监听、UDP `SO_REUSEPORT` worker、TCP/DoT 连接复用、SIGHUP 热加载、EDNS Client Subnet。规划中：DoQ、DoH3、geosite/geoip dat。
 
 | | mosdns-x (Go) | FerrumDNS (Rust) |
 |---|---|---|
@@ -59,7 +60,7 @@ v0.1。已交付：lazy 缓存后台刷新、bootstrap DNS、DoH TLS 监听、UD
 
 ## 安装
 
-需要 Rust 工具链（1.80+，见 [rustup](https://rustup.rs)）。先克隆仓库，再选 **一种** 安装方式。
+二进制从 [GitHub Releases](https://github.com/mutsuki14/ferrumdns/releases/latest) 下载，或从源码编译（Rust 1.80+，见 [rustup](https://rustup.rs)）。先克隆仓库，再选 **一种** 安装方式。
 
 ```sh
 git clone https://github.com/mutsuki14/ferrumdns.git

@@ -621,6 +621,9 @@ async fn doh_exchange(client: &reqwest::Client, url: &str, q: &Message) -> Resul
 
 async fn write_framed<S: AsyncWriteExt + Unpin>(s: &mut S, q: &Message) -> Result<()> {
     let bytes = dnsutil::encode(q)?;
+    if bytes.len() > u16::MAX as usize {
+        return Err(Error::protocol("tcp payload too large"));
+    }
     let len = bytes.len() as u16;
     s.write_all(&len.to_be_bytes()).await?;
     s.write_all(&bytes).await?;

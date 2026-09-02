@@ -155,6 +155,14 @@ impl QueryContext {
     }
 
     pub fn clone_for_lazy(&self) -> Self {
+        let mut c = self.fork();
+        c.skip_cache = true;
+        c
+    }
+
+    /// Independent copy of the query for a parallel pipeline (fallback).
+    /// Unlike `clone_for_lazy`, cache lookup is preserved.
+    pub fn fork(&self) -> Self {
         Self {
             id: next_id(),
             start: Instant::now(),
@@ -166,7 +174,7 @@ impl QueryContext {
             marks: self.marks.clone(),
             trace: Vec::new(),
             trace_enabled: false,
-            skip_cache: true,
+            skip_cache: self.skip_cache,
             strip_ecs_on_reply: self.strip_ecs_on_reply,
         }
     }
@@ -263,4 +271,21 @@ fn next_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ID: AtomicU64 = AtomicU64::new(1);
     ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fork_keeps_cache_lookup_lazy_skips() {
+        let q = build_query("fork.test.", RecordType::A).unwrap();
+        let ctx = QueryContext::new(q, Some("8.8.8.8".parse().unwrap()), ClientProto::Udp);
+        let f = ctx.fork();
+        assert!(!f.skip_cache);
+        assert_eq!(f.client_addr, ctx.client_addr);
+        let lazy = ctx.clone_for_lazy();
+        assert!(lazy.skip_cache);
+        assert_eq!(lazy.client_addr, ctx.client_addr);
+    }
 }
