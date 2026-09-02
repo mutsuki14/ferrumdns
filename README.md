@@ -1,15 +1,15 @@
 # FerrumDNS
 
+**English** | [简体中文](README.zh-CN.md)
+
 **A high-performance plugin-pipeline DNS forwarder written in Rust.**
 
-Inspired by [mosdns-x](https://github.com/pmkol/mosdns-x) — same mental model (plugins, sequences, matchers), implemented from scratch for predictable latency, no GC pauses, and a tiny memory footprint.
+Inspired by [mosdns-x](https://github.com/pmkol/mosdns-x) — same mental model (plugins, sequences, matchers), implemented from scratch for predictable latency, no GC pauses, and a small memory footprint.
 
 [![ci](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml/badge.svg)](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-steelblue.svg)](LICENSE)
 
 ---
-
-FerrumDNS 是一个用 **Rust** 编写的高性能 DNS 转发器。配置模型对齐 mosdns-x / mosdns v5：把缓存、分流、广告拦截、加密上游、回退组合成一条可编排的流水线。
 
 ## Why FerrumDNS
 
@@ -20,6 +20,7 @@ FerrumDNS 是一个用 **Rust** 编写的高性能 DNS 转发器。配置模型�
 | Listen | UDP / TCP / DoT / DoH / DoQ / DoH3 | UDP / TCP / DoT / DoH (HTTPS with `cert`/`key`, or HTTP behind a terminator) |
 | Upstream | UDP / TCP / DoT / DoH / DoQ / DoH3 | UDP / TCP / DoT / DoH (`bootstrap` / `dial_addr`) |
 | Cache | sharded LRU + lazy TTL | sharded LRU + lazy TTL + background refresh |
+| ECS | `ecs` / `_no_ecs` | RFC 7871; cache key includes the subnet |
 | Admin | HTTP + Prometheus | HTTP JSON + Prometheus |
 | Reload | SIGHUP | SIGHUP swaps plugins, keeps sockets |
 
@@ -294,14 +295,14 @@ SIGHUP (`systemctl reload ferrumdns` / `kill -HUP $pid`) rebuilds plugins from t
 
 Bind with `api.http`. Endpoints:
 
-| Method | Path | |
+| Method | Path | Description |
 |---|---|---|
-| GET | `/health` | liveness |
+| GET | `/health` | Liveness |
 | GET | `/metrics` | Prometheus text |
 | GET | `/api/stats` | JSON counters |
-| GET | `/api/plugins` | loaded tags |
+| GET | `/api/plugins` | Loaded tags |
 | POST | `/api/query` | `{ "name", "qtype", "entry?", "ecs?", "client_ip?" }` — debug a query with a pipeline trace |
-| POST | `/api/cache/flush` | drop the LRU |
+| POST | `/api/cache/flush` | Drop the LRU |
 
 ## Config compatibility
 
