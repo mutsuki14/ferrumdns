@@ -138,6 +138,7 @@ pub fn bind_matcher(expr: &str, reg: &Registry) -> Result<Matcher> {
             let n = parts.next().unwrap_or("0").parse().unwrap_or(0);
             Ok(Matcher::Mark(n))
         }
+        "ecs" | "has_ecs" => Ok(Matcher::HasEcs),
         other => Err(Error::config(format!("unknown matcher `{other}`"))),
     }
 }

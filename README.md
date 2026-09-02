@@ -128,6 +128,12 @@ plugins:
         - keyword:doubleclick
         - ads.example.com
 
+  - tag: ecs
+    type: ecs
+    args:
+      ipv4: 8.8.8.8
+      mask4: 24
+
   - tag: cache
     type: cache
     args:
@@ -158,6 +164,7 @@ plugins:
       - exec: $hosts
       - matches: has_resp
         exec: accept
+      - exec: $ecs
       - exec: $cache
       - matches: has_resp
         exec: accept
@@ -184,8 +191,8 @@ client ──► UDP/TCP/DoT/DoH listener
               ▼
          sequence (main)
            ├─ matchers  (qname / qtype / client_ip / resp_ip / has_resp / …)
-           ├─ hosts / blackhole / redirect / ttl
-           ├─ sharded LRU cache  (lazy TTL + background refresh)
+           ├─ hosts / blackhole / redirect / ttl / ecs
+           ├─ sharded LRU cache  (lazy TTL + background refresh; key includes ECS)
            ├─ forward  (race N encrypted upstreams)
            └─ fallback (primary + secondary, optional always_standby)
 ```
@@ -205,11 +212,37 @@ Each query carries a `QueryContext` through the pipeline. Plugins either fill a 
 | `fallback` | Primary/secondary with threshold |
 | `black_hole` | Force an RCODE |
 | `redirect` | Rewrite qname |
+| `ecs` | Attach EDNS Client Subnet (RFC 7871) |
+| `no_ecs` / `_no_ecs` | Strip ECS from query and reply |
 | `udp_server` / `tcp_server` / `tls_server` / `doh_server` | Listeners (also via `servers:`) |
 
-Built-in `exec` commands: `accept`, `return`, `reject <rcode>`, `drop_resp`, `ttl min-max`, `prefer_ipv4`, `prefer_ipv6`, `mark N`, `goto $tag`.
+Built-in `exec` commands: `accept`, `return`, `reject <rcode>`, `drop_resp`, `ttl min-max`, `prefer_ipv4`, `prefer_ipv6`, `mark N`, `goto $tag`, `no_ecs`.
 
-Matchers: `qname $set`, `qtype A AAAA`, `client_ip $set`, `resp_ip $set`, `has_resp`, `has_wanted_ans`, `rcode`, `mark`. Prefix `!` to negate.
+Matchers: `qname $set`, `qtype A AAAA`, `client_ip $set`, `resp_ip $set`, `has_resp`, `has_wanted_ans`, `rcode`, `mark`, `ecs`. Prefix `!` to negate.
+
+### EDNS Client Subnet
+
+Put `ecs` **before** `cache` so geo-steered answers don't collide in the LRU. If the client did not send ECS, the plugin strips it from the reply (RFC 7871 privacy). `auto: true` uses the query source IP and **skips private / CGNAT / loopback** addresses — only enable `auto` on a public resolver.
+
+```yaml
+- tag: ecs
+  type: ecs
+  args:
+    auto: false                 # true = use client IP (public only)
+    ipv4: 8.8.8.8               # preset, preferred on A queries
+    ipv6: "2001:4860:4860::8888"
+    mask4: 24                   # default 24
+    mask6: 48                   # default 48
+    force_overwrite: false      # keep a client-supplied ECS
+
+# later in the sequence:
+- exec: $ecs
+- exec: $cache
+# or drop everything:
+- exec: no_ecs
+```
+
+Admin `POST /api/query` accepts optional `"ecs": "203.0.113.0/24"` and `"client_ip": "8.8.8.8"` to replay.
 
 ### Upstream URL schemes
 
@@ -267,7 +300,7 @@ Bind with `api.http`. Endpoints:
 | GET | `/metrics` | Prometheus text |
 | GET | `/api/stats` | JSON counters |
 | GET | `/api/plugins` | loaded tags |
-| POST | `/api/query` | `{ "name", "qtype", "entry?" }` — debug a query with a pipeline trace |
+| POST | `/api/query` | `{ "name", "qtype", "entry?", "ecs?", "client_ip?" }` — debug a query with a pipeline trace |
 | POST | `/api/cache/flush` | drop the LRU |
 
 ## Config compatibility
@@ -308,6 +341,6 @@ MIT. Architecture inspired by mosdns / mosdns-x (GPL-3.0); this codebase is orig
 
 v0.1 — usable as a LAN / homelab / OpenWrt-class forwarder.
 
-Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, UDP `SO_REUSEPORT` workers, TCP/DoT connection reuse, SIGHUP plugin reload.
+Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, UDP `SO_REUSEPORT` workers, TCP/DoT connection reuse, SIGHUP plugin reload, EDNS Client Subnet.
 
-Planned: DoQ, DoH3, geosite/geoip dat, ECS.
+Planned: DoQ, DoH3, geosite/geoip dat.

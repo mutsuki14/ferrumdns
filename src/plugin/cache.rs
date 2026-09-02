@@ -135,10 +135,11 @@ impl Cache {
         }
         let q0 = q.queries().first()?;
         Some(format!(
-            "{}|{:?}|{:?}",
+            "{}|{:?}|{:?}|{}",
             dnsutil::name_ascii(q0.name()),
             q0.query_type(),
-            q0.query_class()
+            q0.query_class(),
+            dnsutil::ecs_cache_key(q)
         ))
     }
 

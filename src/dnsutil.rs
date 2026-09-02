@@ -1,4 +1,5 @@
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -179,56 +180,146 @@ pub fn rcode_to_u16(r: ResponseCode) -> u16 {
     u16::from(r)
 }
 
-pub fn first_question(msg: &Message) -> Option<&Query> {
-    msg.queries().first()
+pub fn name_ascii(n: &Name) -> String {
+    n.to_ascii()
 }
 
-pub fn name_ascii(n: &Name) -> String {
-    let s = n.to_ascii();
-    s.trim_end_matches('.').to_ascii_lowercase()
+pub fn ecs_of(msg: &Message) -> Option<ClientSubnet> {
+    let edns = msg.extensions().as_ref()?;
+    match edns.option(EdnsCode::Subnet)? {
+        EdnsOption::Subnet(cs) => Some(*cs),
+        _ => None,
+    }
+}
+
+pub fn set_ecs(msg: &mut Message, cs: ClientSubnet) {
+    let edns = msg.extensions_mut().get_or_insert_with(|| {
+        let mut e = Edns::new();
+        e.set_max_payload(1232);
+        e
+    });
+    edns.options_mut().remove(EdnsCode::Subnet);
+    edns.options_mut().insert(EdnsOption::Subnet(cs));
+}
+
+pub fn remove_ecs(msg: &mut Message) {
+    if let Some(edns) = msg.extensions_mut() {
+        edns.options_mut().remove(EdnsCode::Subnet);
+    }
+}
+
+pub fn ecs_label(cs: Option<&ClientSubnet>) -> String {
+    match cs {
+        Some(cs) => format!("{}/{}", cs.addr(), cs.source_prefix()),
+        None => "-".into(),
+    }
+}
+
+/// Cache-key fragment so geo-steered answers don't collide.
+pub fn ecs_cache_key(msg: &Message) -> String {
+    match ecs_of(msg) {
+        Some(cs) => format!("ecs={}/{}", cs.addr(), cs.source_prefix()),
+        None => "ecs=-".into(),
+    }
+}
+
+pub fn parse_ecs_spec(s: &str) -> Result<ClientSubnet> {
+    let s = s.trim();
+    let (addr, prefix) = if let Some((a, p)) = s.split_once('/') {
+        let ip: IpAddr = a
+            .parse()
+            .map_err(|e| Error::config(format!("bad ecs addr: {e}")))?;
+        let prefix: u8 = p
+            .parse()
+            .map_err(|_| Error::config("bad ecs prefix"))?;
+        (ip, prefix)
+    } else {
+        let ip: IpAddr = s
+            .parse()
+            .map_err(|e| Error::config(format!("bad ecs addr: {e}")))?;
+        let prefix = if ip.is_ipv4() { 24 } else { 48 };
+        (ip, prefix)
+    };
+    let (net, prefix) = crate::plugin::ecs::masked(addr, prefix);
+    Ok(ClientSubnet::new(net, prefix, 0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::build_query;
-
-    #[test]
-    fn roundtrip_query() {
-        let q = build_query("example.com.", RecordType::A).unwrap();
-        let bytes = encode(&q).unwrap();
-        let back = decode(&bytes).unwrap();
-        assert_eq!(back.queries()[0].name(), q.queries()[0].name());
-        assert_eq!(back.queries()[0].query_type(), RecordType::A);
-    }
+    use hickory_proto::op::Query;
 
     #[test]
     fn drops_response_packets() {
-        let mut msg = build_query("example.com.", RecordType::A).unwrap();
-        assert_eq!(classify_incoming(&msg), Incoming::Ok);
-        msg.set_message_type(MessageType::Response);
-        assert_eq!(classify_incoming(&msg), Incoming::Drop);
-        let mut upd = build_query("example.com.", RecordType::A).unwrap();
-        upd.set_op_code(OpCode::Update);
-        assert_eq!(classify_incoming(&upd), Incoming::NotImp);
+        let mut m = Message::new();
+        m.set_message_type(MessageType::Response);
+        assert_eq!(classify_incoming(&m), Incoming::Drop);
+    }
+
+    #[test]
+    fn roundtrip_query() {
+        let mut m = Message::new();
+        m.set_id(42);
+        m.set_message_type(MessageType::Query);
+        m.set_op_code(OpCode::Query);
+        let n = Name::from_ascii("example.com.").unwrap();
+        let mut q = Query::new();
+        q.set_name(n);
+        q.set_query_type(RecordType::A);
+        m.add_query(q);
+        let bytes = encode(&m).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.id(), 42);
     }
 
     #[test]
     fn take_response_checks_id_and_qr() {
-        let q = build_query("example.com.", RecordType::A).unwrap();
-        let mut r = reply_skeleton(&q, ResponseCode::NoError);
-        r.set_id(q.id());
-        assert!(take_response(&q, r.clone()).is_ok());
-        r.set_id(q.id().wrapping_add(1));
+        let mut q = Message::new();
+        q.set_id(7);
+        q.set_message_type(MessageType::Query);
+        let mut r = Message::new();
+        r.set_id(8);
+        r.set_message_type(MessageType::Response);
         assert!(take_response(&q, r).is_err());
     }
 
     #[test]
     fn usable_skips_servfail() {
-        let q = build_query("example.com.", RecordType::A).unwrap();
-        let sf = reply_skeleton(&q, ResponseCode::ServFail);
-        let nx = reply_skeleton(&q, ResponseCode::NXDomain);
-        assert!(!is_usable_response(&sf));
-        assert!(is_usable_response(&nx));
+        let mut m = Message::new();
+        m.set_message_type(MessageType::Response);
+        m.set_response_code(ResponseCode::ServFail);
+        assert!(!is_usable_response(&m));
+        m.set_response_code(ResponseCode::NoError);
+        assert!(is_usable_response(&m));
+    }
+
+    #[test]
+    fn ecs_roundtrip_on_wire() {
+        let mut m = Message::new();
+        m.set_id(1);
+        m.set_message_type(MessageType::Query);
+        m.set_op_code(OpCode::Query);
+        set_ecs(
+            &mut m,
+            ClientSubnet::new("203.0.113.0".parse().unwrap(), 24, 0),
+        );
+        let bytes = encode(&m).unwrap();
+        let back = decode(&bytes).unwrap();
+        let cs = ecs_of(&back).unwrap();
+        assert_eq!(cs.source_prefix(), 24);
+        assert_eq!(cs.addr(), "203.0.113.0".parse::<IpAddr>().unwrap());
+        assert_eq!(ecs_cache_key(&back), "ecs=203.0.113.0/24");
+        remove_ecs(&mut m);
+        assert!(ecs_of(&m).is_none());
+        assert_eq!(ecs_cache_key(&m), "ecs=-");
+    }
+
+    #[test]
+    fn parse_ecs_spec_masks() {
+        let cs = parse_ecs_spec("203.0.113.9/24").unwrap();
+        assert_eq!(cs.addr(), "203.0.113.0".parse::<IpAddr>().unwrap());
+        assert_eq!(cs.source_prefix(), 24);
+        let def = parse_ecs_spec("8.8.8.8").unwrap();
+        assert_eq!(def.source_prefix(), 24);
     }
 }

@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod cache;
+pub mod ecs;
 pub mod fallback;
 pub mod forward;
 pub mod hosts;

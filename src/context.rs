@@ -39,6 +39,8 @@ pub struct QueryContext {
     pub trace_enabled: bool,
     /// Skip cache lookup (used by lazy-cache background refresh).
     pub skip_cache: bool,
+    /// We attached ECS that the client did not send — strip it from the reply.
+    pub strip_ecs_on_reply: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -64,6 +66,7 @@ impl QueryContext {
             trace: Vec::new(),
             trace_enabled: false,
             skip_cache: false,
+            strip_ecs_on_reply: false,
         }
     }
 
@@ -164,6 +167,7 @@ impl QueryContext {
             trace: Vec::new(),
             trace_enabled: false,
             skip_cache: true,
+            strip_ecs_on_reply: self.strip_ecs_on_reply,
         }
     }
 

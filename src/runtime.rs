@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 use crate::plugin::actions::{Blackhole, Redirect};
 use crate::plugin::cache::Cache;
+use crate::plugin::ecs::{Ecs, NoEcs};
 use crate::plugin::fallback::{BoundFallback, Fallback};
 use crate::plugin::forward::Forward;
 use crate::plugin::hosts::Hosts;
@@ -135,6 +136,12 @@ impl Runtime {
                 }
                 "redirect" => {
                     execs.insert(tag, Arc::new(Redirect::from_args(&p.args)?));
+                }
+                "ecs" => {
+                    execs.insert(tag.clone(), Ecs::from_args(&tag, &p.args)?);
+                }
+                "no_ecs" | "_no_ecs" => {
+                    execs.insert(tag.clone(), NoEcs::new(tag));
                 }
                 "sequence" => {
                     if default_entry.is_none() {

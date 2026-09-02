@@ -503,6 +503,11 @@ pub async fn handle(
             }
         }
     }
+    if ctx.strip_ecs_on_reply {
+        if let Some(resp) = ctx.response_mut() {
+            dnsutil::remove_ecs(resp);
+        }
+    }
     if ctx.has_resp() {
         rt.metrics
             .responses

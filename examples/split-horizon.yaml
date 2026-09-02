@@ -10,6 +10,14 @@ api:
   http: 127.0.0.1:9090
 
 plugins:
+  - tag: ecs
+    type: ecs
+    args:
+      ipv4: 8.8.8.8
+      ipv6: "2001:4860:4860::8888"
+      mask4: 24
+      mask6: 48
+
   - tag: cache
     type: cache
     args:
@@ -91,6 +99,7 @@ plugins:
       - exec: $hosts
       - matches: has_resp
         exec: accept
+      - exec: $ecs
       - exec: $cache
       - matches: has_resp
         exec: accept

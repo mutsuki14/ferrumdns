@@ -226,6 +226,7 @@ pub enum Matcher {
     HasWantedAns,
     Rcode(u16),
     Mark(u32),
+    HasEcs,
     Neg(Box<Matcher>),
 }
 
@@ -252,6 +253,7 @@ impl Matcher {
                 .map(|r| dnsutil::rcode_to_u16(r.response_code()) == *code)
                 .unwrap_or(false),
             Matcher::Mark(m) => ctx.has_mark(*m),
+            Matcher::HasEcs => dnsutil::ecs_of(ctx.query()).is_some(),
             Matcher::Neg(inner) => !inner.matches(ctx),
         }
     }

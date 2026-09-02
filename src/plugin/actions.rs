@@ -16,6 +16,7 @@ pub enum Builtin {
     PreferV6,
     Mark(u32),
     Goto(String),
+    NoEcs,
 }
 
 impl Builtin {
@@ -54,6 +55,7 @@ impl Builtin {
                     .to_string();
                 Ok(Self::Goto(tag))
             }
+            "no_ecs" | "_no_ecs" => Ok(Self::NoEcs),
             other => Err(Error::config(format!(
                 "unknown builtin exec `{other}` (did you forget `$` for a plugin tag?)"
             ))),
@@ -71,6 +73,7 @@ impl Builtin {
             Self::PreferV6 => "prefer_ipv6".into(),
             Self::Mark(m) => format!("mark {m}"),
             Self::Goto(t) => format!("goto {t}"),
+            Self::NoEcs => "no_ecs".into(),
         }
     }
 
@@ -103,6 +106,11 @@ impl Builtin {
                 Ok(Action::Continue)
             }
             Self::Goto(t) => Ok(Action::Goto(t.clone())),
+            Self::NoEcs => {
+                dnsutil::remove_ecs(ctx.query_mut());
+                ctx.strip_ecs_on_reply = true;
+                Ok(Action::Continue)
+            }
         }
     }
 }

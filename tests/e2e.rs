@@ -208,6 +208,61 @@ plugins:
 }
 
 #[tokio::test]
+async fn ecs_attaches_is_cached_separately_and_stripped_from_reply() {
+    let yaml = r#"
+plugins:
+  - tag: ecs
+    type: ecs
+    args:
+      ipv4: 203.0.113.9
+      mask4: 24
+  - tag: hosts
+    type: hosts
+    args:
+      entries: ["9.9.9.9 ecs.test"]
+  - tag: cache
+    type: cache
+    args: { size: 64 }
+  - tag: main
+    type: sequence
+    args:
+      - exec: $ecs
+      - exec: $cache
+      - matches: has_resp
+        exec: accept
+      - exec: $hosts
+"#;
+    let cfg = Config::from_yaml(yaml).unwrap();
+    let rt = Runtime::build(cfg).await.unwrap();
+
+    let q = build_query("ecs.test.", RecordType::A).unwrap();
+    let mut ctx = QueryContext::new(q.clone(), None, ClientProto::Udp);
+    ctx.trace_enabled = true;
+    rt.handle_query(&mut ctx, "main").await.unwrap();
+    assert!(ctx.has_resp());
+    assert!(
+        ctx.trace.iter().any(|t| t.event == "attach" && t.plugin == "ecs"),
+        "trace={:?}",
+        ctx.trace
+    );
+    assert!(
+        ferrumdns::dnsutil::ecs_of(ctx.response().unwrap()).is_none(),
+        "injected ECS must not leak to the client"
+    );
+    // query still carries ECS internally after pipeline
+    assert!(ferrumdns::dnsutil::ecs_of(ctx.query()).is_some());
+
+    let mut hit = QueryContext::new(q, None, ClientProto::Udp);
+    hit.trace_enabled = true;
+    rt.handle_query(&mut hit, "main").await.unwrap();
+    assert!(
+        hit.trace.iter().any(|t| t.event == "hit" && t.plugin == "cache"),
+        "ecs-keyed cache should hit, trace={:?}",
+        hit.trace
+    );
+}
+
+#[tokio::test]
 async fn example_configs_build() {
     use std::path::Path;
     for file in [

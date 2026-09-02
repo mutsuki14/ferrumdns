@@ -70,6 +70,12 @@ struct QueryReq {
     qtype: String,
     #[serde(default)]
     entry: Option<String>,
+    /// Optional EDNS Client Subnet, e.g. `"203.0.113.0/24"`.
+    #[serde(default)]
+    ecs: Option<String>,
+    /// Optional client address (used by `ecs: auto`).
+    #[serde(default)]
+    client_ip: Option<String>,
 }
 
 fn default_qtype() -> String {
@@ -82,6 +88,7 @@ struct QueryResp {
     answers: Vec<String>,
     elapsed_us: u64,
     cache_hit: bool,
+    ecs: Option<String>,
     trace: Vec<TraceEvent>,
 }
 
@@ -93,7 +100,16 @@ async fn query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> std::re
         name.push('.');
     }
     let msg = build_query(&name, qtype).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let mut ctx = QueryContext::new(msg, None, ClientProto::Https);
+    let mut msg = msg;
+    if let Some(spec) = req.ecs.as_deref() {
+        let cs = dnsutil::parse_ecs_spec(spec).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        dnsutil::set_ecs(&mut msg, cs);
+    }
+    let client_ip = req
+        .client_ip
+        .as_deref()
+        .and_then(|s| s.parse().ok());
+    let mut ctx = QueryContext::new(msg, client_ip, ClientProto::Https);
     ctx.trace_enabled = true;
     let entry = req
         .entry
@@ -119,11 +135,13 @@ async fn query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> std::re
     let cache_hit = ctx.trace.iter().any(|t| {
         (t.event == "hit" || t.event == "lazy_hit") && rt.registry.caches.contains_key(&t.plugin)
     });
+    let ecs = dnsutil::ecs_of(ctx.query()).map(|cs| dnsutil::ecs_label(Some(&cs)));
     Ok(Json(QueryResp {
         rcode,
         answers,
         elapsed_us: ctx.start.elapsed().as_micros() as u64,
         cache_hit,
+        ecs,
         trace: ctx.trace,
     }))
 }
