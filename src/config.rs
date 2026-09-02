@@ -117,7 +117,7 @@ impl Config {
     pub fn from_yaml(text: &str) -> Result<Self> {
         let mut cfg: Config =
             serde_yaml::from_str(text).map_err(|e| Error::config(format!("yaml parse: {e}")))?;
-        cfg.lift_server_plugins();
+        cfg.lift_server_plugins()?;
         Ok(cfg)
     }
 
@@ -146,6 +146,16 @@ impl Config {
                 p.base_dir = self.base_dir.clone();
             }
         }
+        for s in &mut self.servers {
+            for l in &mut s.listeners {
+                if let Some(c) = &l.cert {
+                    l.cert = Some(resolve_path(&self.base_dir, c).display().to_string());
+                }
+                if let Some(k) = &l.key {
+                    l.key = Some(resolve_path(&self.base_dir, k).display().to_string());
+                }
+            }
+        }
     }
 
     fn merge(&mut self, other: Config) {
@@ -158,7 +168,7 @@ impl Config {
 
     /// mosdns v5-style `udp_server` / `tcp_server` / `http_server` plugins
     /// are lifted into the `servers` array so the runtime has one path.
-    fn lift_server_plugins(&mut self) {
+    fn lift_server_plugins(&mut self) -> Result<()> {
         let mut keep = Vec::with_capacity(self.plugins.len());
         for p in self.plugins.drain(..) {
             match p.ty.as_str() {
@@ -172,16 +182,24 @@ impl Config {
                     let entry = p
                         .args
                         .get("entry")
+                        .or_else(|| p.args.get("exec"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
+                        .trim_start_matches('$')
                         .to_string();
-                    let listen = p
+                    let listen = match p
                         .args
                         .get("listen")
                         .or_else(|| p.args.get("addr"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0.0.0.0:53")
-                        .to_string();
+                    {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(_) => {
+                            return Err(Error::config(
+                                "server `listen` must be a string (one address), not a list",
+                            ))
+                        }
+                        None => "0.0.0.0:53".into(),
+                    };
                     let timeout = p
                         .args
                         .get("timeout")
@@ -205,7 +223,8 @@ impl Config {
                                 .map(str::to_string),
                             url_path: p
                                 .args
-                                .get("path")
+                                .get("url_path")
+                                .or_else(|| p.args.get("path"))
                                 .and_then(|v| v.as_str())
                                 .map(str::to_string),
                             idle_timeout: p.args.get("idle_timeout").and_then(|v| v.as_u64()),
@@ -221,6 +240,7 @@ impl Config {
             }
         }
         self.plugins = keep;
+        Ok(())
     }
 }
 
@@ -279,5 +299,34 @@ plugins:
         assert_eq!(p, PathBuf::from("/etc/ferrumdns/./hosts.txt"));
         let abs = resolve_path(Path::new("/etc/ferrumdns"), "/var/lib/hosts");
         assert_eq!(abs, PathBuf::from("/var/lib/hosts"));
+    }
+
+    #[test]
+    fn lifts_exec_alias_and_strips_dollar() {
+        let yaml = r#"
+plugins:
+  - tag: main
+    type: sequence
+    args:
+      - exec: accept
+  - type: udp_server
+    args:
+      exec: $main
+      listen: 127.0.0.1:5353
+"#;
+        let cfg = Config::from_yaml(yaml).unwrap();
+        assert_eq!(cfg.servers[0].exec, "main");
+    }
+
+    #[test]
+    fn listen_list_is_an_error() {
+        let yaml = r#"
+plugins:
+  - type: udp_server
+    args:
+      entry: main
+      listen: [127.0.0.1:53, "[::1]:53"]
+"#;
+        assert!(Config::from_yaml(yaml).is_err());
     }
 }

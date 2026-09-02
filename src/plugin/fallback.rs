@@ -70,7 +70,7 @@ impl Executable for BoundFallback {
             let s = secondary.clone();
             let thresh = f.threshold;
 
-            let primary_task = tokio::spawn(async move {
+            let mut primary_task = tokio::spawn(async move {
                 let _ = p.exec(&mut pctx).await;
                 pctx
             });
@@ -79,21 +79,21 @@ impl Executable for BoundFallback {
                 sctx
             });
 
-            match timeout(thresh, primary_task).await {
+            match timeout(thresh, &mut primary_task).await {
                 Ok(Ok(pctx)) if pctx.has_wanted_ans() => {
+                    secondary_task.abort();
                     ctx.push_trace(&f.tag, "primary", "ok");
-                    if let Some(r) = pctx.response().cloned() {
-                        ctx.set_response(r);
-                    }
+                    ctx.absorb(pctx);
                     return Ok(Action::Continue);
                 }
-                _ => {}
+                Ok(_) => {}
+                Err(_) => {
+                    primary_task.abort();
+                }
             }
             if let Ok(sctx) = secondary_task.await {
                 ctx.push_trace(&f.tag, "secondary", "used");
-                if let Some(r) = sctx.response().cloned() {
-                    ctx.set_response(r);
-                }
+                ctx.absorb(sctx);
             }
             return Ok(Action::Continue);
         }

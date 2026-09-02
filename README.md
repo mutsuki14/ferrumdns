@@ -45,7 +45,7 @@ Inspired by [mosdns-x](https://github.com/pmkol/mosdns-x) — same mental model 
 
 FerrumDNS is a LAN / homelab / OpenWrt-class forwarder. The pipeline is mosdns-compatible YAML: plugins tagged and wired through a `sequence` of `matches` + `exec`.
 
-v0.1.0 is the first tagged release. Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, UDP `SO_REUSEPORT` workers, TCP/DoT connection reuse, SIGHUP plugin reload, EDNS Client Subnet. Planned: DoQ, DoH3, geosite/geoip dat.
+v0.1.1. First tagged line was 0.1.0. Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, UDP `SO_REUSEPORT` workers, TCP/DoT connection reuse, SIGHUP plugin reload, EDNS Client Subnet. Planned: DoQ, DoH3, geosite/geoip dat.
 
 | | mosdns-x (Go) | FerrumDNS (Rust) |
 |---|---|---|

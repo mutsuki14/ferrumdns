@@ -170,6 +170,9 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
             true
         }
         IpAddr::V6(v) => {
+            if let Some(v4) = v.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
             let s = v.segments();
             !v.is_loopback()
                 && !v.is_unspecified()
@@ -293,5 +296,8 @@ mod tests {
         assert!(!is_public_ip("::1".parse().unwrap()));
         assert!(is_public_ip("2001:4860:4860::8888".parse().unwrap()));
         assert!(!is_public_ip("fc00::1".parse().unwrap()));
+        assert!(!is_public_ip("::ffff:192.168.1.1".parse().unwrap()));
+        assert!(!is_public_ip("::ffff:100.64.1.1".parse().unwrap()));
+        assert!(is_public_ip("::ffff:1.1.1.1".parse().unwrap()));
     }
 }

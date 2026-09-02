@@ -1,6 +1,6 @@
 [package]
 name = "ferrumdns"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 description = "High-performance plugin-pipeline DNS forwarder, inspired by mosdns-x"

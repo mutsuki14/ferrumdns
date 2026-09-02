@@ -48,11 +48,21 @@ impl RawStep {
                 let matches = match m.get(&Value::from("matches")) {
                     None => Vec::new(),
                     Some(Value::String(s)) => vec![s.clone()],
-                    Some(Value::Sequence(seq)) => seq
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect(),
-                    _ => Vec::new(),
+                    Some(Value::Sequence(seq)) => {
+                        let mut out = Vec::with_capacity(seq.len());
+                        for v in seq {
+                            let s = v.as_str().ok_or_else(|| {
+                                Error::config("sequence `matches` entries must be strings")
+                            })?;
+                            out.push(s.to_string());
+                        }
+                        out
+                    }
+                    _ => {
+                        return Err(Error::config(
+                            "sequence `matches` must be a string or a list of strings",
+                        ))
+                    }
                 };
                 Ok(Self { matches, exec })
             }
@@ -143,13 +153,10 @@ pub fn bind_matcher(expr: &str, reg: &Registry) -> Result<Matcher> {
     }
 }
 
-pub fn compile_steps(
-    tag: &str,
-    raw: Vec<RawStep>,
-    reg: &Registry,
-    caches: Vec<Arc<Cache>>,
-) -> Result<Sequence> {
+pub fn compile_steps(tag: &str, raw: Vec<RawStep>, reg: &Registry) -> Result<Sequence> {
     let mut steps = Vec::new();
+    let mut caches = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for r in raw {
         let matchers = r
             .matches
@@ -157,6 +164,13 @@ pub fn compile_steps(
             .map(|s| bind_matcher(s, reg))
             .collect::<Result<Vec<_>>>()?;
         let exec = parse_exec(&r.exec)?;
+        if let Exec::Plugin(ref tag) = exec {
+            if let Some(c) = reg.caches.get(tag) {
+                if seen.insert(tag.clone()) {
+                    caches.push(c.clone());
+                }
+            }
+        }
         steps.push(Step { matchers, exec });
     }
     Ok(Sequence {

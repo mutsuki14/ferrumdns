@@ -45,7 +45,7 @@
 
 FerrumDNS 面向局域网 / 家庭实验室 / OpenWrt 级转发。流水线是 mosdns 兼容的 YAML：插件用 tag 引用，经 `sequence` 的 `matches` + `exec` 串联。
 
-v0.1.0 是第一个 tagged release。已交付：lazy 缓存后台刷新、bootstrap DNS、DoH TLS 监听、UDP `SO_REUSEPORT` worker、TCP/DoT 连接复用、SIGHUP 热加载、EDNS Client Subnet。规划中：DoQ、DoH3、geosite/geoip dat。
+v0.1.1。首个 tag 是 0.1.0。已交付：lazy 缓存后台刷新、bootstrap DNS、DoH TLS 监听、UDP `SO_REUSEPORT` worker、TCP/DoT 连接复用、SIGHUP 热加载、EDNS Client Subnet。规划中：DoQ、DoH3、geosite/geoip dat。
 
 | | mosdns-x (Go) | FerrumDNS (Rust) |
 |---|---|---|

@@ -197,6 +197,9 @@ impl Cache {
     }
 
     pub fn maybe_store(&self, ctx: &QueryContext) {
+        if ctx.served_from_cache {
+            return;
+        }
         if let Some(key) = Self::key_of(ctx, self.cache_everything) {
             if ctx.has_resp() {
                 self.store(key, ctx);
@@ -220,7 +223,10 @@ impl Cache {
         }
         let mut bg = ctx.clone_for_lazy();
         let weak = weak.clone();
-        let entry = entry.clone();
+        let entry = ctx
+            .pipeline_entry
+            .clone()
+            .unwrap_or_else(|| entry.clone());
         let inflight = self.inflight.clone();
         let key = key.to_string();
         tokio::spawn(async move {
@@ -258,6 +264,7 @@ impl Executable for Cache {
                     ctx.push_trace(&self.tag, "hit", &key);
                 }
                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                ctx.served_from_cache = true;
                 ctx.set_response(msg);
                 return Ok(Action::Continue);
             }

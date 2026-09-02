@@ -491,6 +491,9 @@ pub async fn handle(
             ctx.reject(ResponseCode::NotImp);
         }
         Incoming::Ok => {
+            if ctx.pipeline_entry.is_none() {
+                ctx.pipeline_entry = Some(entry.to_string());
+            }
             let exec = rt.registry.get_exec(entry)?;
             match tokio::time::timeout(timeout, exec.exec(ctx)).await {
                 Ok(Ok(Action::Continue | Action::Accept | Action::Return | Action::Goto(_))) => {}

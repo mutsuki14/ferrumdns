@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.1.1] — 2026-09-02
+
+Cache-poisoning and pipeline-entry fixes found after the 0.1.0 review.
+
+### English
+
+- Only the sequence that actually runs `$cache` writes that LRU (helper sequences no longer fill the global cache)
+- Cache hits / lazy hits are not written back (that used to reset the lazy expire window and freeze stale answers)
+- Lazy refresh and the admin API re-enter the listener `exec` (`main`), not the first `sequence` in the file
+- `fallback` `always_standby` aborts the loser and copies the winner's full context (ECS strip flag, rewritten question, marks)
+- `ecs.auto` treats IPv4-mapped IPv6 private / CGNAT addresses as private
+- `udp_server` accepts `exec` as an alias of `entry`, strips `$`, rejects a list-valued `listen`, and reads `url_path`
+- Sequence `matches` that are not strings fail at load instead of matching everything
+
+### 简体中文
+
+- 只有真正执行了 `$cache` 的 sequence 才会写入该 LRU（辅助 sequence 不再污染全局缓存）
+- 缓存命中 / lazy 命中不再回写（以前会重置 lazy 过期窗口，把过期答案“续命”）
+- lazy 刷新和管理 API 走监听的 `exec`（`main`），而不是文件里第一条 sequence
+- `fallback` `always_standby` 会 abort 落败的那路，并完整拷贝胜者上下文（ECS 剥离标记、改写后的问题、mark）
+- `ecs.auto` 把 IPv4-mapped IPv6 的内网 / CGNAT 地址当私网
+- `udp_server` 接受 `exec` 作为 `entry` 别名、去掉 `$`、拒绝列表形式的 `listen`、读取 `url_path`
+- sequence 的 `matches` 如果不是字符串，加载时直接报错，而不是匹配全部
+
 ## [0.1.0] — 2026-09-02
 
 First tagged release.
@@ -40,4 +64,5 @@ Fixes in this tag:
 - `fallback` 的 `always_standby` 不再误跳过缓存
 - UDP 截断应答保留 OPT（RFC 6891）
 
+[0.1.1]: https://github.com/mutsuki14/ferrumdns/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mutsuki14/ferrumdns/releases/tag/v0.1.0

@@ -41,6 +41,10 @@ pub struct QueryContext {
     pub skip_cache: bool,
     /// We attached ECS that the client did not send — strip it from the reply.
     pub strip_ecs_on_reply: bool,
+    /// Response came from a cache hit; do not write it back (would reset TTLs).
+    pub served_from_cache: bool,
+    /// Listener / API pipeline tag. Lazy refresh re-enters this, not the first sequence.
+    pub pipeline_entry: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -67,6 +71,8 @@ impl QueryContext {
             trace_enabled: false,
             skip_cache: false,
             strip_ecs_on_reply: false,
+            served_from_cache: false,
+            pipeline_entry: None,
         }
     }
 
@@ -157,6 +163,7 @@ impl QueryContext {
     pub fn clone_for_lazy(&self) -> Self {
         let mut c = self.fork();
         c.skip_cache = true;
+        c.served_from_cache = false;
         c
     }
 
@@ -176,6 +183,21 @@ impl QueryContext {
             trace_enabled: false,
             skip_cache: self.skip_cache,
             strip_ecs_on_reply: self.strip_ecs_on_reply,
+            served_from_cache: self.served_from_cache,
+            pipeline_entry: self.pipeline_entry.clone(),
+        }
+    }
+
+    /// Copy pipeline results from a forked context (fallback winner).
+    pub fn absorb(&mut self, other: Self) {
+        self.query = other.query;
+        self.response = other.response;
+        self.marks = other.marks;
+        self.strip_ecs_on_reply = other.strip_ecs_on_reply;
+        self.skip_cache = other.skip_cache;
+        self.served_from_cache = other.served_from_cache;
+        if self.trace_enabled {
+            self.trace.extend(other.trace);
         }
     }
 

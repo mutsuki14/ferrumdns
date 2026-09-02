@@ -106,7 +106,6 @@ impl Runtime {
         let mut execs: HashMap<String, Arc<dyn Executable>> = HashMap::new();
         let mut pending_seq: Vec<(String, serde_yaml::Value)> = Vec::new();
         let mut pending_fb: Vec<(String, Fallback)> = Vec::new();
-        let mut default_entry = None;
 
         for p in &config.plugins {
             let tag = p.tag.clone().unwrap_or_else(|| p.ty.clone());
@@ -144,9 +143,6 @@ impl Runtime {
                     execs.insert(tag.clone(), NoEcs::new(tag));
                 }
                 "sequence" => {
-                    if default_entry.is_none() {
-                        default_entry = Some(tag.clone());
-                    }
                     pending_seq.push((tag, p.args.clone()));
                 }
                 "fallback" => {
@@ -156,7 +152,7 @@ impl Runtime {
             }
         }
 
-        let cache_list: Vec<Arc<Cache>> = caches.values().cloned().collect();
+        let default_entry = pick_default_entry(&config, &pending_seq);
         let mut registry = Registry {
             execs,
             domains,
@@ -170,10 +166,7 @@ impl Runtime {
             let mut v = Vec::new();
             for (tag, args) in &pending_seq {
                 let raw = parse_steps(args)?;
-                v.push((
-                    tag.clone(),
-                    compile_steps(tag, raw, &registry, cache_list.clone())?,
-                ));
+                v.push((tag.clone(), compile_steps(tag, raw, &registry)?));
             }
             v
         };
@@ -217,6 +210,19 @@ impl Runtime {
     ) -> Result<()> {
         server::handle(self, entry, ctx, Duration::from_secs(5)).await
     }
+}
+
+fn pick_default_entry(
+    config: &Config,
+    pending_seq: &[(String, serde_yaml::Value)],
+) -> Option<String> {
+    for s in &config.servers {
+        let e = s.exec.trim_start_matches('$');
+        if !e.is_empty() {
+            return Some(e.to_string());
+        }
+    }
+    pending_seq.last().map(|(tag, _)| tag.clone())
 }
 
 fn bind_cache_refresh(rt: &Arc<Runtime>) {
