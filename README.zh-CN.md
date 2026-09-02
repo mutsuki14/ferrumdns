@@ -1,17 +1,50 @@
 # FerrumDNS
 
-[English](README.md) | **简体中文**
+[English](README.md) | [**简体中文**](README.zh-CN.md)
 
-**用 Rust 编写的高性能插件流水线 DNS 转发器。**
+[![ci](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml/badge.svg)](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-steelblue.svg?style=flat-square)](LICENSE)
+[![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
+
+用 Rust 编写的高性能插件流水线 DNS 转发器。
 
 配置心智对齐 [mosdns-x](https://github.com/pmkol/mosdns-x)：插件、sequence、matcher。从零实现，延迟可预期，没有 GC 停顿，内存占用小。
 
-[![ci](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml/badge.svg)](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-MIT-steelblue.svg)](LICENSE)
+## 内容列表
 
----
+- [安全](#安全)
+- [背景](#背景)
+- [安装](#安装)
+  - [系统二进制](#系统二进制)
+  - [无需 root](#无需-root)
+  - [Docker](#docker)
+  - [systemd](#systemd)
+- [使用说明](#使用说明)
+  - [快速开始](#快速开始)
+  - [架构](#架构)
+  - [插件](#插件)
+  - [EDNS Client Subnet](#edns-client-subnet)
+  - [上游](#上游)
+  - [监听](#监听)
+  - [兼容性](#兼容性)
+  - [性能](#性能)
+- [API](#api)
+- [维护者](#维护者)
+- [如何贡献](#如何贡献)
+- [使用许可](#使用许可)
 
-## 为什么选 FerrumDNS
+## 安全
+
+- 除非前面有鉴权，否则把 `api.http` 绑在回环地址。管理接口能清空缓存、回放查询。
+- `ecs.auto: true` 只适合**公网**解析器。内网 / CGNAT / 回环地址会被跳过，但也不该把局域网 IP 当作子网广播到公网。
+- 不要打开 `insecure_skip_verify`。它会关掉 DoT/DoH 上游的 TLS 校验。
+- 入站应答（`QR=1`）和非 QUERY 操作码会被丢弃或回 `NOTIMP`，避免成为反射放大器。
+
+## 背景
+
+FerrumDNS 面向局域网 / 家庭实验室 / OpenWrt 级转发。流水线是 mosdns 兼容的 YAML：插件用 tag 引用，经 `sequence` 的 `matches` + `exec` 串联。
+
+v0.1。已交付：lazy 缓存后台刷新、bootstrap DNS、DoH TLS 监听、UDP `SO_REUSEPORT` worker、TCP/DoT 连接复用、SIGHUP 热加载、EDNS Client Subnet。规划中：DoQ、DoH3、geosite/geoip dat。
 
 | | mosdns-x (Go) | FerrumDNS (Rust) |
 |---|---|---|
@@ -28,14 +61,16 @@
 
 需要 Rust 工具链（1.80+，见 [rustup](https://rustup.rs)）。先克隆仓库，再选 **一种** 安装方式。
 
-```bash
+```sh
 git clone https://github.com/mutsuki14/ferrumdns.git
 cd ferrumdns
 ```
 
-### A. 系统二进制（绑定 `:53`）
+### 系统二进制
 
-```bash
+绑定 `:53`。需要 root 或 `CAP_NET_BIND_SERVICE`（[systemd 单元](systemd/ferrumdns.service) 已经带上该能力）。
+
+```sh
 cargo build --release
 sudo install -m 0755 target/release/ferrumdns /usr/local/bin/ferrumdns
 sudo mkdir -p /etc/ferrumdns
@@ -44,24 +79,22 @@ ferrumdns check -c /etc/ferrumdns/config.yaml
 sudo ferrumdns start -c /etc/ferrumdns/config.yaml
 ```
 
-`:53` 需要 root 或 `CAP_NET_BIND_SERVICE`（[systemd 单元](systemd/ferrumdns.service) 已经带上该能力）。查询：
-
-```bash
+```sh
 dig @127.0.0.1 router.lan
 curl -s http://127.0.0.1:9090/api/stats
 ```
 
-### B. 用户安装、高端口（无需 root）
+### 无需 root
 
 `cargo install` 把二进制放到 `~/.cargo/bin`。把该目录加入 `PATH`。**不要**用 `sudo` 跑它 — sudo 的 PATH 不含 `~/.cargo/bin`。
 
-```bash
+```sh
 cargo install --path . --locked
 ferrumdns check -c examples/dev.yaml
 ferrumdns start -c examples/dev.yaml
 ```
 
-```bash
+```sh
 dig @127.0.0.1 -p 5353 router.lan
 curl -s http://127.0.0.1:9090/api/stats
 ```
@@ -70,7 +103,7 @@ curl -s http://127.0.0.1:9090/api/stats
 
 镜像内置 `examples/docker.yaml`（管理 API 听 `0.0.0.0:9090`，映射 9090 即可访问）。**不要**挂载一个还不存在的宿主机路径 — Docker 会在那里创建一个目录，进程读配置会失败。
 
-```bash
+```sh
 docker build -t ferrumdns .
 docker run --rm --name ferrumdns \
   -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
@@ -79,7 +112,7 @@ docker run --rm --name ferrumdns \
 
 覆盖内置配置时，挂载一个已经存在的文件：
 
-```bash
+```sh
 docker run --rm --name ferrumdns \
   -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
   -v "$PWD/examples/docker.yaml:/etc/ferrumdns/config.yaml:ro" \
@@ -88,7 +121,7 @@ docker run --rm --name ferrumdns \
 
 ### systemd
 
-```bash
+```sh
 sudo mkdir -p /etc/ferrumdns
 sudo cp examples/simple.yaml /etc/ferrumdns/config.yaml
 sudo install -m 0755 target/release/ferrumdns /usr/local/bin/ferrumdns
@@ -99,7 +132,9 @@ sudo systemctl enable --now ferrumdns
 sudo systemctl reload ferrumdns   # SIGHUP — 换插件，套接字不关
 ```
 
-## 快速开始
+## 使用说明
+
+### 快速开始
 
 仓库内示例：
 
@@ -184,7 +219,9 @@ plugins:
 
 保存为 `config.yaml`，然后 `ferrumdns check -c config.yaml && ferrumdns start -c config.yaml`。
 
-## 架构
+`examples/dev.yaml` 绑定 `127.0.0.1:5353`，无需 root。`examples/simple.yaml` 绑定 `:53`，普通用户会得到 `permission denied`。
+
+### 架构
 
 ```
 客户端 ──► UDP/TCP/DoT/DoH 监听
@@ -200,7 +237,7 @@ plugins:
 
 每条查询带着 `QueryContext` 走过流水线。插件负责填应答、改写问题，或跳转（`accept` / `return` / `goto` / `reject`）。
 
-## 插件
+### 插件
 
 | 类型 | 作用 |
 |---|---|
@@ -245,7 +282,7 @@ Matcher：`qname $set`、`qtype A AAAA`、`client_ip $set`、`resp_ip $set`、`h
 
 管理口 `POST /api/query` 可带 `"ecs": "203.0.113.0/24"` 和 `"client_ip": "8.8.8.8"` 做回放。
 
-### 上游地址
+### 上游
 
 ```
 udp://8.8.8.8:53
@@ -291,9 +328,25 @@ servers:
 
 SIGHUP（`systemctl reload ferrumdns` / `kill -HUP $pid`）从同一份配置重建插件。改监听地址或证书路径仍需重启。
 
-## 管理 API
+### 兼容性
 
-用 `api.http` 绑定。接口：
+FerrumDNS 接受 **mosdns v5 风格** 的插件列表（`matches` / `exec` / `$tag`）以及 **mosdns-x 风格** 的 `servers:` + `listeners`。并非所有 mosdns-x 插件都已实现（暂无 nftset、DoQ/DoH3）。目标是覆盖人们实际在跑的转发 / 分流 / 广告拦截配置的可落地子集。
+
+相对路径的 `files:`（`hosts`、`domain_set`、`ip_set`）和 `include:` 相对配置文件所在目录解析。
+
+### 性能
+
+- 多线程 tokio，UDP `SO_REUSEPORT` worker（默认 `min(8, CPU)`）
+- 16 路分片缓存，热路径少抢 LRU 锁
+- Lazy 缓存：先用短 TTL 应答，后台刷新
+- DoH 连接池（reqwest/hyper HTTP/2）；主机名用 `bootstrap` / `dial_addr` 钉 IP
+- DoT / TCP 复用带长度前缀的 RFC 7766 会话（空闲池 8）
+- SIGHUP 换插件不丢套接字
+- Release：thin LTO、`opt-level=3`、strip
+
+## API
+
+用 `api.http` 绑定。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -304,25 +357,7 @@ SIGHUP（`systemctl reload ferrumdns` / `kill -HUP $pid`）从同一份配置重
 | POST | `/api/query` | `{ "name", "qtype", "entry?", "ecs?", "client_ip?" }` — 带流水线 trace 的调试查询 |
 | POST | `/api/cache/flush` | 清空 LRU |
 
-## 配置兼容性
-
-FerrumDNS 接受 **mosdns v5 风格** 的插件列表（`matches` / `exec` / `$tag`）以及 **mosdns-x 风格** 的 `servers:` + `listeners`。并非所有 mosdns-x 插件都已实现（暂无 nftset、DoQ/DoH3）。目标是覆盖人们实际在跑的转发 / 分流 / 广告拦截配置的可落地子集。
-
-相对路径的 `files:`（`hosts`、`domain_set`、`ip_set`）和 `include:` 相对配置文件所在目录解析。
-
-## 性能要点
-
-- 多线程 tokio，UDP `SO_REUSEPORT` worker（默认 `min(8, CPU)`）
-- 16 路分片缓存，热路径少抢 LRU 锁
-- Lazy 缓存：先用短 TTL 应答，后台刷新
-- DoH 连接池（reqwest/hyper HTTP/2）；主机名用 `bootstrap` / `dial_addr` 钉 IP
-- DoT / TCP 复用带长度前缀的 RFC 7766 会话（空闲池 8）
-- SIGHUP 换插件不丢套接字
-- Release：thin LTO、`opt-level=3`、strip
-
-## 开发
-
-```bash
+```sh
 cargo test --all
 cargo run -- start -c examples/dev.yaml
 dig @127.0.0.1 -p 5353 router.lan
@@ -332,16 +367,20 @@ curl -s -X POST http://127.0.0.1:9090/api/query \
   -d '{"name":"router.lan","qtype":"A"}'
 ```
 
-`examples/dev.yaml` 绑定 `127.0.0.1:5353`，无需 root。`examples/simple.yaml` 绑定 `:53`，普通用户会得到 `permission denied`。
+## 维护者
 
-## 许可证
+[@mutsuki14](https://github.com/mutsuki14)
 
-MIT。架构参考 mosdns / mosdns-x（GPL-3.0）；本仓库代码是全新的 Rust 实现。
+## 如何贡献
 
-## 状态
+欢迎 Issue 和 Pull Request。
 
-v0.1 — 可用于局域网 / 家庭实验室 / OpenWrt 级转发。
+提交补丁前请运行 `cargo test --all`。
 
-已交付：lazy 缓存后台刷新、bootstrap DNS、DoH TLS 监听、UDP `SO_REUSEPORT` worker、TCP/DoT 连接复用、SIGHUP 热加载、EDNS Client Subnet。
+若修改 README，请遵循 [standard-readme](https://github.com/RichardLitt/standard-readme) 规范，并同步更新 [README.md](README.md) 与 [README.zh-CN.md](README.zh-CN.md)。
 
-规划中：DoQ、DoH3、geosite/geoip dat。
+## 使用许可
+
+[MIT © mutsuki14](LICENSE)
+
+架构参考 mosdns / mosdns-x（GPL-3.0）；本仓库代码是全新的 Rust 实现。

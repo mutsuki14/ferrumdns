@@ -1,17 +1,50 @@
 # FerrumDNS
 
-**English** | [简体中文](README.zh-CN.md)
+[**English**](README.md) | [简体中文](README.zh-CN.md)
 
-**A high-performance plugin-pipeline DNS forwarder written in Rust.**
+[![ci](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml/badge.svg)](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-steelblue.svg?style=flat-square)](LICENSE)
+[![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
+
+A high-performance plugin-pipeline DNS forwarder written in Rust.
 
 Inspired by [mosdns-x](https://github.com/pmkol/mosdns-x) — same mental model (plugins, sequences, matchers), implemented from scratch for predictable latency, no GC pauses, and a small memory footprint.
 
-[![ci](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml/badge.svg)](https://github.com/mutsuki14/ferrumdns/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-MIT-steelblue.svg)](LICENSE)
+## Table of Contents
 
----
+- [Security](#security)
+- [Background](#background)
+- [Install](#install)
+  - [System binary](#system-binary)
+  - [Without root](#without-root)
+  - [Docker](#docker)
+  - [systemd](#systemd)
+- [Usage](#usage)
+  - [Quick start](#quick-start)
+  - [Architecture](#architecture)
+  - [Plugins](#plugins)
+  - [EDNS Client Subnet](#edns-client-subnet)
+  - [Upstreams](#upstreams)
+  - [Listeners](#listeners)
+  - [Compatibility](#compatibility)
+  - [Performance](#performance)
+- [API](#api)
+- [Maintainers](#maintainers)
+- [Contributing](#contributing)
+- [License](#license)
 
-## Why FerrumDNS
+## Security
+
+- Bind `api.http` to loopback unless it sits behind something that authenticates callers. The admin API can flush the cache and replay queries.
+- `ecs.auto: true` only belongs on a **public** resolver. Private, CGNAT, and loopback client addresses are skipped, but you still should not advertise a LAN IP as a subnet to the internet.
+- Leave `insecure_skip_verify` off. It disables TLS validation for DoT/DoH upstreams.
+- Incoming responses (`QR=1`) and non-QUERY opcodes are dropped or answered `NOTIMP` so the listener is not an amplifier.
+
+## Background
+
+FerrumDNS is a LAN / homelab / OpenWrt-class forwarder. The pipeline is mosdns-compatible YAML: plugins tagged and wired through a `sequence` of `matches` + `exec`.
+
+v0.1. Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, UDP `SO_REUSEPORT` workers, TCP/DoT connection reuse, SIGHUP plugin reload, EDNS Client Subnet. Planned: DoQ, DoH3, geosite/geoip dat.
 
 | | mosdns-x (Go) | FerrumDNS (Rust) |
 |---|---|---|
@@ -26,16 +59,18 @@ Inspired by [mosdns-x](https://github.com/pmkol/mosdns-x) — same mental model 
 
 ## Install
 
-Requires a Rust toolchain (1.80+, via [rustup](https://rustup.rs)). Clone the repo, then pick **one** install path.
+Requires a Rust toolchain (1.80+, via [rustup](https://rustup.rs)). Clone the repo, then pick **one** path.
 
-```bash
+```sh
 git clone https://github.com/mutsuki14/ferrumdns.git
 cd ferrumdns
 ```
 
-### A. System binary (bind `:53`)
+### System binary
 
-```bash
+Binds `:53`. Needs root or `CAP_NET_BIND_SERVICE` (the [systemd unit](systemd/ferrumdns.service) already sets the capability).
+
+```sh
 cargo build --release
 sudo install -m 0755 target/release/ferrumdns /usr/local/bin/ferrumdns
 sudo mkdir -p /etc/ferrumdns
@@ -44,24 +79,22 @@ ferrumdns check -c /etc/ferrumdns/config.yaml
 sudo ferrumdns start -c /etc/ferrumdns/config.yaml
 ```
 
-`:53` needs root or `CAP_NET_BIND_SERVICE` (the [systemd unit](systemd/ferrumdns.service) already sets the capability). Query it with:
-
-```bash
+```sh
 dig @127.0.0.1 router.lan
 curl -s http://127.0.0.1:9090/api/stats
 ```
 
-### B. User install, high port (no root)
+### Without root
 
 `cargo install` puts the binary in `~/.cargo/bin`. Put that directory on your `PATH`. **Do not** run it via `sudo` — sudo's PATH does not include `~/.cargo/bin`.
 
-```bash
+```sh
 cargo install --path . --locked
 ferrumdns check -c examples/dev.yaml
 ferrumdns start -c examples/dev.yaml
 ```
 
-```bash
+```sh
 dig @127.0.0.1 -p 5353 router.lan
 curl -s http://127.0.0.1:9090/api/stats
 ```
@@ -70,7 +103,7 @@ curl -s http://127.0.0.1:9090/api/stats
 
 The image already contains `examples/docker.yaml` (API on `0.0.0.0:9090` so published port 9090 is reachable). Do **not** mount a host path that does not exist — Docker will create a directory there and the process will fail to read the config.
 
-```bash
+```sh
 docker build -t ferrumdns .
 docker run --rm --name ferrumdns \
   -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
@@ -79,7 +112,7 @@ docker run --rm --name ferrumdns \
 
 To override the baked-in config, pass a file that already exists:
 
-```bash
+```sh
 docker run --rm --name ferrumdns \
   -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
   -v "$PWD/examples/docker.yaml:/etc/ferrumdns/config.yaml:ro" \
@@ -88,7 +121,7 @@ docker run --rm --name ferrumdns \
 
 ### systemd
 
-```bash
+```sh
 sudo mkdir -p /etc/ferrumdns
 sudo cp examples/simple.yaml /etc/ferrumdns/config.yaml
 sudo install -m 0755 target/release/ferrumdns /usr/local/bin/ferrumdns
@@ -99,7 +132,9 @@ sudo systemctl enable --now ferrumdns
 sudo systemctl reload ferrumdns   # SIGHUP — plugins swap, sockets stay
 ```
 
-## Quick start
+## Usage
+
+### Quick start
 
 Checked-in configs:
 
@@ -184,7 +219,9 @@ plugins:
 
 Save that as `config.yaml` and run `ferrumdns check -c config.yaml && ferrumdns start -c config.yaml`.
 
-## Architecture
+`examples/dev.yaml` binds `127.0.0.1:5353` so this does not need root. `examples/simple.yaml` binds `:53` and will fail with `permission denied` as a normal user.
+
+### Architecture
 
 ```
 client ──► UDP/TCP/DoT/DoH listener
@@ -200,7 +237,7 @@ client ──► UDP/TCP/DoT/DoH listener
 
 Each query carries a `QueryContext` through the pipeline. Plugins either fill a response, rewrite the question, or jump (`accept` / `return` / `goto` / `reject`).
 
-## Plugins
+### Plugins
 
 | Type | Role |
 |---|---|
@@ -245,7 +282,7 @@ Put `ecs` **before** `cache` so geo-steered answers don't collide in the LRU. If
 
 Admin `POST /api/query` accepts optional `"ecs": "203.0.113.0/24"` and `"client_ip": "8.8.8.8"` to replay.
 
-### Upstream URL schemes
+### Upstreams
 
 ```
 udp://8.8.8.8:53
@@ -291,9 +328,25 @@ servers:
 
 SIGHUP (`systemctl reload ferrumdns` / `kill -HUP $pid`) rebuilds plugins from the same config file. Listen address and certificate path changes still need a restart.
 
-## Admin API
+### Compatibility
 
-Bind with `api.http`. Endpoints:
+FerrumDNS accepts **mosdns v5-style** plugin lists (`matches` / `exec` / `$tag`) and **mosdns-x-style** `servers:` + `listeners`. Not every mosdns-x plugin is implemented (no nftset, no DoQ/DoH3 yet). The goal is a drop-in subset for the forwarding / split-horizon / ad-block setups people actually run.
+
+Relative `files:` entries (`hosts`, `domain_set`, `ip_set`) and `include:` are resolved against the config file's directory.
+
+### Performance
+
+- Multi-thread tokio runtime, UDP `SO_REUSEPORT` workers (default `min(8, CPU)`)
+- 16-way sharded cache to keep LRU locks off the hot path
+- Lazy cache: serve a short TTL immediately, refresh in the background
+- DoH connection pooling via reqwest/hyper HTTP/2; hostname pin via `bootstrap` / `dial_addr`
+- DoT / TCP reuse length-prefixed RFC 7766 sessions (idle pool of 8)
+- SIGHUP reloads plugins without dropping sockets
+- Release profile: LTO thin, `opt-level=3`, stripped
+
+## API
+
+Bind with `api.http`.
 
 | Method | Path | Description |
 |---|---|---|
@@ -304,25 +357,7 @@ Bind with `api.http`. Endpoints:
 | POST | `/api/query` | `{ "name", "qtype", "entry?", "ecs?", "client_ip?" }` — debug a query with a pipeline trace |
 | POST | `/api/cache/flush` | Drop the LRU |
 
-## Config compatibility
-
-FerrumDNS accepts **mosdns v5-style** plugin lists (`matches` / `exec` / `$tag`) and **mosdns-x-style** `servers:` + `listeners`. Not every mosdns-x plugin is implemented (no nftset, no DoQ/DoH3 yet). The goal is a drop-in subset for the forwarding / split-horizon / ad-block setups people actually run.
-
-Relative `files:` entries (`hosts`, `domain_set`, `ip_set`) and `include:` are resolved against the config file's directory.
-
-## Performance notes
-
-- Multi-thread tokio runtime, UDP `SO_REUSEPORT` workers (default `min(8, CPU)`)
-- 16-way sharded cache to keep LRU locks off the hot path
-- Lazy cache: serve a short TTL immediately, refresh in the background
-- DoH connection pooling via reqwest/hyper HTTP/2; hostname pin via `bootstrap` / `dial_addr`
-- DoT / TCP reuse length-prefixed RFC 7766 sessions (idle pool of 8)
-- SIGHUP reloads plugins without dropping sockets
-- Release profile: LTO thin, `opt-level=3`, stripped
-
-## Development
-
-```bash
+```sh
 cargo test --all
 cargo run -- start -c examples/dev.yaml
 dig @127.0.0.1 -p 5353 router.lan
@@ -332,16 +367,20 @@ curl -s -X POST http://127.0.0.1:9090/api/query \
   -d '{"name":"router.lan","qtype":"A"}'
 ```
 
-`examples/dev.yaml` binds `127.0.0.1:5353` so this does not need root. `examples/simple.yaml` binds `:53` and will fail with `permission denied` as a normal user.
+## Maintainers
+
+[@mutsuki14](https://github.com/mutsuki14)
+
+## Contributing
+
+Issues and pull requests are welcome.
+
+Run `cargo test --all` before sending a patch.
+
+If you edit the README, follow the [standard-readme](https://github.com/RichardLitt/standard-readme) specification and keep [README.md](README.md) and [README.zh-CN.md](README.zh-CN.md) in sync.
 
 ## License
 
-MIT. Architecture inspired by mosdns / mosdns-x (GPL-3.0); this codebase is original.
+[MIT © mutsuki14](LICENSE)
 
-## Status
-
-v0.1 — usable as a LAN / homelab / OpenWrt-class forwarder.
-
-Shipped: lazy-cache background refresh, bootstrap DNS, DoH TLS listeners, UDP `SO_REUSEPORT` workers, TCP/DoT connection reuse, SIGHUP plugin reload, EDNS Client Subnet.
-
-Planned: DoQ, DoH3, geosite/geoip dat.
+Architecture inspired by mosdns / mosdns-x (GPL-3.0); this codebase is original.
