@@ -35,7 +35,9 @@ impl Builtin {
                 Ok(Self::Reject(dnsutil::rcode_from_str(code)))
             }
             "ttl" => {
-                let spec = parts.next().unwrap_or("0-0");
+                let spec = parts
+                    .next()
+                    .ok_or_else(|| Error::config("ttl needs a value or range"))?;
                 let (min, max) = parse_ttl_range(spec)?;
                 Ok(Self::Ttl { min, max })
             }
@@ -90,6 +92,9 @@ impl Builtin {
                 Ok(Action::Continue)
             }
             Self::Ttl { min, max } => {
+                if min > max {
+                    return Err(Error::config("ttl minimum must not exceed maximum"));
+                }
                 ctx.apply_ttl_clamp(*min, *max);
                 Ok(Action::Continue)
             }
@@ -117,8 +122,17 @@ impl Builtin {
 
 fn parse_ttl_range(spec: &str) -> Result<(u32, u32)> {
     if let Some((a, b)) = spec.split_once('-') {
-        let min: u32 = a.trim().parse().unwrap_or(0);
-        let max: u32 = b.trim().parse().unwrap_or(u32::MAX);
+        let min: u32 = a
+            .trim()
+            .parse()
+            .map_err(|_| Error::config("bad ttl minimum"))?;
+        let max: u32 = b
+            .trim()
+            .parse()
+            .map_err(|_| Error::config("bad ttl maximum"))?;
+        if min > max {
+            return Err(Error::config("ttl minimum must not exceed maximum"));
+        }
         Ok((min, max))
     } else {
         let v: u32 = spec.parse().map_err(|_| Error::config("bad ttl"))?;
@@ -126,8 +140,8 @@ fn parse_ttl_range(spec: &str) -> Result<(u32, u32)> {
     }
 }
 
-use async_trait::async_trait;
 use crate::plugin::Executable;
+use async_trait::async_trait;
 
 pub struct Blackhole {
     rcode: ResponseCode,
@@ -153,27 +167,49 @@ impl Executable for Blackhole {
 }
 
 pub struct Redirect {
-    rules: Vec<(String, String)>,
+    rules: Vec<(String, hickory_proto::rr::Name)>,
 }
 
 impl Redirect {
     pub fn from_args(args: &serde_yaml::Value) -> Result<Self> {
         let mut rules = Vec::new();
-        if let Some(map) = args.get("rules").and_then(|v| v.as_mapping()) {
-            for (k, v) in map {
-                if let (Some(from), Some(to)) = (k.as_str(), v.as_str()) {
-                    rules.push((from.to_ascii_lowercase(), to.to_string()));
+        let mut add = |from: &str, to: &str| -> Result<()> {
+            let from = hickory_proto::rr::Name::from_ascii(from)
+                .map_err(|e| Error::config(format!("bad redirect source `{from}`: {e}")))?;
+            let to = hickory_proto::rr::Name::from_ascii(to)
+                .map_err(|e| Error::config(format!("bad redirect target `{to}`: {e}")))?;
+            rules.push((
+                from.to_ascii().trim_end_matches('.').to_ascii_lowercase(),
+                to,
+            ));
+            Ok(())
+        };
+        match args.get("rules") {
+            None => {}
+            Some(serde_yaml::Value::Mapping(map)) => {
+                for (k, v) in map {
+                    let from = k
+                        .as_str()
+                        .ok_or_else(|| Error::config("redirect source must be a string"))?;
+                    let to = v
+                        .as_str()
+                        .ok_or_else(|| Error::config("redirect target must be a string"))?;
+                    add(from, to)?;
                 }
             }
-        }
-        if let Some(seq) = args.get("rules").and_then(|v| v.as_sequence()) {
-            for item in seq {
-                if let Some(s) = item.as_str() {
-                    if let Some((a, b)) = s.split_once(' ') {
-                        rules.push((a.to_ascii_lowercase(), b.to_string()));
+            Some(serde_yaml::Value::Sequence(seq)) => {
+                for item in seq {
+                    let s = item
+                        .as_str()
+                        .ok_or_else(|| Error::config("redirect rule must be a string"))?;
+                    let parts: Vec<_> = s.split_whitespace().collect();
+                    if parts.len() != 2 {
+                        return Err(Error::config("redirect rule needs source and target"));
                     }
+                    add(parts[0], parts[1])?;
                 }
             }
+            Some(_) => return Err(Error::config("redirect rules must be a map or list")),
         }
         Ok(Self { rules })
     }
@@ -186,12 +222,8 @@ impl Executable for Redirect {
         for (from, to) in &self.rules {
             let from = from.trim_end_matches('.');
             if qn == from || qn.ends_with(&format!(".{from}")) {
-                if let Ok(name) = hickory_proto::rr::Name::from_ascii(to) {
-                    if let Some(q) = ctx.query_mut().queries_mut().first_mut() {
-                        q.set_name(name);
-                    }
-                    ctx.push_trace("redirect", "rewrite", &format!("{qn} -> {to}"));
-                }
+                ctx.rewrite_name(to.clone());
+                ctx.push_trace("redirect", "rewrite", &format!("{qn} -> {to}"));
                 break;
             }
         }

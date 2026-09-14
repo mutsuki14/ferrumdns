@@ -18,7 +18,6 @@ Inspired by [mosdns-x](https://github.com/pmkol/mosdns-x) — same mental model 
 - [Install](#install)
   - [System binary](#system-binary)
   - [Without root](#without-root)
-  - [Docker](#docker)
   - [systemd](#systemd)
 - [Usage](#usage)
   - [Quick start](#quick-start)
@@ -60,7 +59,7 @@ v0.1.1. First tagged line was 0.1.0. Shipped: lazy-cache background refresh, boo
 
 ## Install
 
-Download a binary from [GitHub Releases](https://github.com/mutsuki14/ferrumdns/releases/latest), or build from source (Rust 1.80+, via [rustup](https://rustup.rs)). Clone the repo, then pick **one** path.
+Download a binary from [GitHub Releases](https://github.com/mutsuki14/ferrumdns/releases/latest), or build from source (Rust 1.88+, via [rustup](https://rustup.rs)). Clone the repo, then pick **one** path.
 
 ```sh
 git clone https://github.com/mutsuki14/ferrumdns.git
@@ -72,7 +71,7 @@ cd ferrumdns
 Binds `:53`. Needs root or `CAP_NET_BIND_SERVICE` (the [systemd unit](systemd/ferrumdns.service) already sets the capability).
 
 ```sh
-cargo build --release
+cargo build --release --locked
 sudo install -m 0755 target/release/ferrumdns /usr/local/bin/ferrumdns
 sudo mkdir -p /etc/ferrumdns
 sudo cp examples/simple.yaml /etc/ferrumdns/config.yaml
@@ -100,26 +99,6 @@ dig @127.0.0.1 -p 5353 router.lan
 curl -s http://127.0.0.1:9090/api/stats
 ```
 
-### Docker
-
-The image already contains `examples/docker.yaml` (API on `0.0.0.0:9090` so published port 9090 is reachable). Do **not** mount a host path that does not exist — Docker will create a directory there and the process will fail to read the config.
-
-```sh
-docker build -t ferrumdns .
-docker run --rm --name ferrumdns \
-  -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
-  ferrumdns
-```
-
-To override the baked-in config, pass a file that already exists:
-
-```sh
-docker run --rm --name ferrumdns \
-  -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
-  -v "$PWD/examples/docker.yaml:/etc/ferrumdns/config.yaml:ro" \
-  ferrumdns
-```
-
 ### systemd
 
 ```sh
@@ -143,7 +122,6 @@ Checked-in configs:
 |---|---|---|---|
 | [`examples/simple.yaml`](examples/simple.yaml) | `0.0.0.0:53` | `127.0.0.1:9090` | local / systemd |
 | [`examples/dev.yaml`](examples/dev.yaml) | `127.0.0.1:5353` | `127.0.0.1:9090` | `cargo run`, no root |
-| [`examples/docker.yaml`](examples/docker.yaml) | `0.0.0.0:53` | `0.0.0.0:9090` | container |
 | [`examples/split-horizon.yaml`](examples/split-horizon.yaml) | `0.0.0.0:53` | `127.0.0.1:9090` | ads + CN split + fallback |
 
 `files:` paths inside a YAML file are resolved relative to that file, so `ferrumdns check -c examples/split-horizon.yaml` works from the repo root.
@@ -283,6 +261,8 @@ Put `ecs` **before** `cache` so geo-steered answers don't collide in the LRU. If
 
 Admin `POST /api/query` accepts optional `"ecs": "203.0.113.0/24"` and `"client_ip": "8.8.8.8"` to replay.
 
+`mask4` accepts `0–32` and `mask6` accepts `0–128`; `0` sends a `/0` prefix with no address bits. Out-of-range or non-integer values are rejected before serving.
+
 ### Upstreams
 
 ```
@@ -327,7 +307,13 @@ servers:
         url_path: /dns-query
 ```
 
-SIGHUP (`systemctl reload ferrumdns` / `kill -HUP $pid`) rebuilds plugins from the same config file. Listen address and certificate path changes still need a restart.
+DoH `client_ip` matching and automatic ECS use the direct peer IP. Behind a reverse proxy this is the proxy IP; `X-Forwarded-For` is not consumed.
+
+SIGHUP (`systemctl reload ferrumdns` / `kill -HUP $pid`) rebuilds plugins from the same config file. The next query on an existing TCP/DoT connection uses the new rules too. Invalid reloads retain the running configuration. Listener, entry, API and logging changes require a restart, as does replacing TLS certificate contents.
+
+`ferrumdns check -c config.yaml` validates plugin references, dependency cycles, listener protocols, addresses and TLS files. At startup, a failed listener or API bind causes a nonzero process exit.
+
+Optional `log.file` appends logs to a file, resolving relative paths against the config file's directory. Its parent directory must already exist. Without it, logs go to the terminal.
 
 ### Compatibility
 
@@ -377,6 +363,8 @@ curl -s -X POST http://127.0.0.1:9090/api/query \
 Issues and pull requests are welcome.
 
 Run `cargo test --all` before sending a patch.
+
+See the [audit fix record](docs/audit-fixes.md) for the mapping from reviewed issues to regression coverage.
 
 If you edit the README, follow the [standard-readme](https://github.com/RichardLitt/standard-readme) specification and keep [README.md](README.md) and [README.zh-CN.md](README.zh-CN.md) in sync.
 

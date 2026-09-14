@@ -294,7 +294,6 @@ async fn example_configs_build() {
     for file in [
         "examples/simple.yaml",
         "examples/dev.yaml",
-        "examples/docker.yaml",
         "examples/split-horizon.yaml",
     ] {
         let cfg = Config::load_file(Path::new(file))

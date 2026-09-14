@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ferrumdns::config::LogConfig;
 use ferrumdns::{Config, Live, Runtime, VERSION};
+use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -36,17 +40,18 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Check { config } => {
-            init_log("info");
-            let cfg = Config::load_file(&config)
-                .with_context(|| format!("load {}", config.display()))?;
-            let _rt = Runtime::build(cfg).await.context("build runtime")?;
+            init_log(&LogConfig::default())?;
+            let cfg =
+                Config::load_file(&config).with_context(|| format!("load {}", config.display()))?;
+            let rt = Runtime::build(cfg).await.context("build runtime")?;
+            rt.validate_service().context("validate service")?;
             println!("config ok ({})", config.display());
             Ok(())
         }
         Command::Start { config } => {
-            let cfg = Config::load_file(&config)
-                .with_context(|| format!("load {}", config.display()))?;
-            init_log(&cfg.log.level);
+            let cfg =
+                Config::load_file(&config).with_context(|| format!("load {}", config.display()))?;
+            init_log(&cfg.log)?;
             tracing::info!(file = %config.display(), version = VERSION, "starting ferrumdns");
             let _ = rustls::crypto::ring::default_provider().install_default();
             let rt = Runtime::build(cfg).await.context("build runtime")?;
@@ -66,14 +71,28 @@ async fn main() -> Result<()> {
     }
 }
 
-fn init_log(level: &str) {
+fn init_log(log: &LogConfig) -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("ferrumdns={level},info")));
+        .or_else(|_| EnvFilter::try_new(format!("ferrumdns={},info", log.level)))
+        .context("invalid log filter")?;
+    let writer = if let Some(path) = &log.file {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open log file {path}"))?;
+        BoxMakeWriter::new(Mutex::new(file))
+    } else {
+        BoxMakeWriter::new(std::io::stdout)
+    };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(writer)
+        .with_ansi(log.file.is_none())
         .with_target(false)
         .compact()
         .init();
+    Ok(())
 }
 
 /// SIGHUP rebuilds plugins from disk without dropping UDP/TCP sockets.
@@ -87,8 +106,7 @@ async fn reload_loop(live: Live, path: PathBuf) {
             return;
         }
     };
-    loop {
-        hangup.recv().await;
+    while hangup.recv().await.is_some() {
         tracing::info!(file = %path.display(), "SIGHUP: reloading plugins");
         match live.reload_file(&path).await {
             Ok(()) => tracing::info!("reload ok (listeners unchanged; cache rebuilt)"),
@@ -106,7 +124,8 @@ async fn shutdown_signal() {
     };
     #[cfg(unix)]
     let term = async {
-        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             s.recv().await;
         }
     };

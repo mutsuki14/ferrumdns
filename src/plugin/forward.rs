@@ -1,8 +1,8 @@
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 use crate::context::QueryContext;
 use crate::dnsutil;
@@ -34,7 +34,9 @@ impl Forward {
             other => vec![other.clone()],
         };
         if items.is_empty() {
-            return Err(Error::config(format!("forward `{tag}` has empty upstreams")));
+            return Err(Error::config(format!(
+                "forward `{tag}` has empty upstreams"
+            )));
         }
         let mut upstreams = Vec::new();
         for item in items {
@@ -46,10 +48,7 @@ impl Forward {
             .and_then(|v| v.as_u64())
             .unwrap_or(1)
             .max(1) as usize;
-        let timeout_raw = args
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5000);
+        let timeout_raw = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(5000);
         if timeout_raw > 0 && timeout_raw < 50 {
             tracing::warn!(
                 plugin = %tag,
@@ -95,22 +94,19 @@ impl Executable for Forward {
             return Ok(Action::Continue);
         }
 
-        let (tx, mut rx) = mpsc::channel::<(usize, Result<hickory_proto::op::Message>)>(n);
+        // Keep upstream futures owned by this request so choosing a winner or
+        // cancelling a fallback/request immediately cancels losing exchanges.
+        let mut pending = FuturesUnordered::new();
         for (i, up) in self.upstreams.iter().take(n).enumerate() {
             let up = up.clone();
             let q = q.clone();
-            let tx = tx.clone();
             let timeout = self.timeout;
-            tokio::spawn(async move {
-                let r = up.exchange(&q, timeout).await;
-                let _ = tx.send((i, r)).await;
-            });
+            pending.push(async move { (i, up.exchange(&q, timeout).await) });
         }
-        drop(tx);
 
         let mut last_err: Option<String> = None;
         let mut last_unusable: Option<hickory_proto::op::Message> = None;
-        while let Some((i, r)) = rx.recv().await {
+        while let Some((i, r)) = pending.next().await {
             match r {
                 Ok(msg) if dnsutil::is_usable_response(&msg) => {
                     self.metrics.upstream_ok.fetch_add(1, Ordering::Relaxed);

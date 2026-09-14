@@ -92,9 +92,13 @@ struct QueryResp {
     trace: Vec<TraceEvent>,
 }
 
-async fn query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> std::result::Result<Json<QueryResp>, (StatusCode, String)> {
+async fn query(
+    State(st): State<AppState>,
+    Json(req): Json<QueryReq>,
+) -> std::result::Result<Json<QueryResp>, (StatusCode, String)> {
     let rt = st.live.get();
-    let qtype = dnsutil::qtype_from_str(&req.qtype).ok_or((StatusCode::BAD_REQUEST, "bad qtype".into()))?;
+    let qtype =
+        dnsutil::qtype_from_str(&req.qtype).ok_or((StatusCode::BAD_REQUEST, "bad qtype".into()))?;
     let mut name = req.name.clone();
     if !name.ends_with('.') {
         name.push('.');
@@ -102,19 +106,28 @@ async fn query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> std::re
     let msg = build_query(&name, qtype).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let mut msg = msg;
     if let Some(spec) = req.ecs.as_deref() {
-        let cs = dnsutil::parse_ecs_spec(spec).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        let cs =
+            dnsutil::parse_ecs_spec(spec).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         dnsutil::set_ecs(&mut msg, cs);
     }
     let client_ip = req
         .client_ip
         .as_deref()
-        .and_then(|s| s.parse().ok());
+        .map(|s| {
+            s.parse()
+                .map_err(|_| (StatusCode::BAD_REQUEST, "bad client_ip".into()))
+        })
+        .transpose()?;
     let mut ctx = QueryContext::new(msg, client_ip, ClientProto::Https);
     ctx.trace_enabled = true;
     let entry = req
         .entry
+        .map(|entry| entry.trim().trim_start_matches('$').to_string())
         .or_else(|| rt.registry.default_entry.clone())
         .ok_or((StatusCode::BAD_REQUEST, "no entry".into()))?;
+    rt.registry
+        .get_exec(&entry)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     rt.handle_query(&mut ctx, &entry)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;

@@ -1,7 +1,6 @@
 # Local / systemd example.
 # Binds :53 (needs root or CAP_NET_BIND_SERVICE) and the admin API on loopback.
 # Non-root dev:  examples/dev.yaml
-# Docker:        examples/docker.yaml
 log:
   level: info
 

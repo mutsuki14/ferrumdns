@@ -105,7 +105,7 @@ fn load_file(table: &mut HostTable, path: &Path) -> Result<()> {
 }
 
 fn parse_hosts_line(table: &mut HostTable, line: &str) -> Result<()> {
-    let line = line.trim();
+    let line = line.split('#').next().unwrap_or("").trim();
     if line.is_empty() || line.starts_with('#') {
         return Ok(());
     }
@@ -125,7 +125,14 @@ fn parse_hosts_line(table: &mut HostTable, line: &str) -> Result<()> {
     let ip: IpAddr = ip_s
         .parse()
         .map_err(|e| Error::config(format!("bad ip in hosts `{ip_s}`: {e}")))?;
+    if names.is_empty() {
+        return Err(Error::config(format!(
+            "hosts line needs a hostname: {line}"
+        )));
+    }
     for n in names {
+        Name::from_ascii(&n)
+            .map_err(|e| Error::config(format!("bad hostname in hosts `{n}`: {e}")))?;
         let key = n.trim_end_matches('.').to_ascii_lowercase();
         table.by_name.entry(key).or_default().push(HostRec { ip });
     }

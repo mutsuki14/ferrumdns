@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::future::{select, Either};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -30,7 +31,10 @@ impl Fallback {
             .ok_or_else(|| Error::config("fallback needs `secondary`"))?
             .trim_start_matches('$')
             .to_string();
-        let threshold_ms = args.get("threshold").and_then(|v| v.as_u64()).unwrap_or(500);
+        let threshold_ms = args
+            .get("threshold")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500);
         let always_standby = args
             .get("always_standby")
             .and_then(|v| v.as_bool())
@@ -66,47 +70,59 @@ impl Executable for BoundFallback {
         if f.always_standby {
             let mut pctx = ctx.fork();
             let mut sctx = ctx.fork();
-            let p = primary.clone();
-            let s = secondary.clone();
-            let thresh = f.threshold;
-
-            let mut primary_task = tokio::spawn(async move {
-                let _ = p.exec(&mut pctx).await;
-                pctx
+            // These futures are owned by this request: dropping the outer
+            // request or choosing a winner also drops the losing upstream work.
+            let primary_run = Box::pin(timeout(f.threshold, async move {
+                let result = primary.exec(&mut pctx).await;
+                (result, pctx)
+            }));
+            let secondary_run = Box::pin(async move {
+                let result = secondary.exec(&mut sctx).await;
+                (result, sctx)
             });
-            let secondary_task = tokio::spawn(async move {
-                let _ = s.exec(&mut sctx).await;
-                sctx
-            });
-
-            match timeout(thresh, &mut primary_task).await {
-                Ok(Ok(pctx)) if pctx.has_wanted_ans() => {
-                    secondary_task.abort();
-                    ctx.push_trace(&f.tag, "primary", "ok");
-                    ctx.absorb(pctx);
-                    return Ok(Action::Continue);
+            let (result, sctx) = match select(primary_run, secondary_run).await {
+                Either::Left((primary_result, secondary_run)) => {
+                    if let Ok((Ok(_), pctx)) = primary_result {
+                        if pctx.has_wanted_ans() {
+                            ctx.push_trace(&f.tag, "primary", "ok");
+                            ctx.absorb(pctx);
+                            return Ok(Action::Continue);
+                        }
+                    }
+                    secondary_run.await
                 }
-                Ok(_) => {}
-                Err(_) => {
-                    primary_task.abort();
+                Either::Right((secondary_result, primary_run)) => {
+                    // A ready backup must not preempt a primary that is still
+                    // within its configured preference window.
+                    if let Ok((Ok(_), pctx)) = primary_run.await {
+                        if pctx.has_wanted_ans() {
+                            ctx.push_trace(&f.tag, "primary", "ok");
+                            ctx.absorb(pctx);
+                            return Ok(Action::Continue);
+                        }
+                    }
+                    secondary_result
                 }
-            }
-            if let Ok(sctx) = secondary_task.await {
-                ctx.push_trace(&f.tag, "secondary", "used");
-                ctx.absorb(sctx);
-            }
+            };
+            ctx.push_trace(&f.tag, "secondary", "used");
+            ctx.absorb(sctx);
+            result?;
             return Ok(Action::Continue);
         }
 
-        match timeout(f.threshold, primary.exec(ctx)).await {
-            Ok(Ok(_)) if ctx.has_wanted_ans() => {
+        let mut pctx = ctx.fork();
+        match timeout(f.threshold, primary.exec(&mut pctx)).await {
+            Ok(Ok(_)) if pctx.has_wanted_ans() => {
                 ctx.push_trace(&f.tag, "primary", "ok");
+                ctx.absorb(pctx);
                 Ok(Action::Continue)
             }
             _ => {
-                ctx.drop_response();
                 ctx.push_trace(&f.tag, "secondary", "fallback");
-                secondary.exec(ctx).await?;
+                let mut sctx = ctx.fork();
+                let result = secondary.exec(&mut sctx).await;
+                ctx.absorb(sctx);
+                result?;
                 Ok(Action::Continue)
             }
         }

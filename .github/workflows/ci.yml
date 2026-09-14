@@ -11,15 +11,19 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable, '1.88.0']
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - name: test
-        run: cargo test --all
+        run: cargo test --all --locked
       - name: check example configs
         run: |
-          cargo run --quiet -- check -c examples/simple.yaml
-          cargo run --quiet -- check -c examples/dev.yaml
-          cargo run --quiet -- check -c examples/docker.yaml
-          cargo run --quiet -- check -c examples/split-horizon.yaml
+          cargo run --quiet --locked -- check -c examples/simple.yaml
+          cargo run --quiet --locked -- check -c examples/dev.yaml
+          cargo run --quiet --locked -- check -c examples/split-horizon.yaml

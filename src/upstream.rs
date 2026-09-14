@@ -1,3 +1,4 @@
+use futures::stream::{FuturesUnordered, StreamExt};
 use hickory_proto::op::Message;
 use hickory_proto::rr::{RData, RecordType};
 use rustls::pki_types::ServerName;
@@ -16,6 +17,7 @@ use crate::dnsutil;
 use crate::error::{Error, Result};
 
 const POOL_CAP: usize = 8;
+const BOOTSTRAP_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct UpstreamSpec {
@@ -106,6 +108,7 @@ pub struct Upstream {
     pub spec: UpstreamSpec,
     kind: Kind,
     http: Option<reqwest::Client>,
+    resolver: Option<Arc<PinResolver>>,
     tls: Option<TlsConnector>,
     tcp_pool: Option<Arc<StreamPool<TcpStream>>>,
     tls_pool: Option<Arc<StreamPool<TlsStream<TcpStream>>>>,
@@ -178,10 +181,11 @@ impl Upstream {
             }
         };
 
-        let http = if matches!(kind, Kind::Doh { .. }) {
-            Some(build_http_client(&spec, &kind)?)
+        let (http, resolver) = if matches!(kind, Kind::Doh { .. }) {
+            let (client, resolver) = build_http_client(&spec, &kind)?;
+            (Some(client), resolver)
         } else {
-            None
+            (None, None)
         };
 
         let tls = if matches!(kind, Kind::Tls { .. }) {
@@ -205,6 +209,7 @@ impl Upstream {
             spec,
             kind,
             http,
+            resolver,
             tls,
             tcp_pool,
             tls_pool,
@@ -216,7 +221,7 @@ impl Upstream {
     }
 
     pub async fn exchange(&self, q: &Message, time_limit: Duration) -> Result<Message> {
-        timeout(time_limit, self.exchange_inner(q))
+        timeout(time_limit, self.exchange_inner(q, time_limit))
             .await
             .map_err(|_| Error::Upstream {
                 addr: self.spec.addr.clone(),
@@ -224,28 +229,33 @@ impl Upstream {
             })?
     }
 
-    async fn exchange_inner(&self, q: &Message) -> Result<Message> {
+    async fn exchange_inner(&self, q: &Message, time_limit: Duration) -> Result<Message> {
+        // Leave at least half of the exchange budget for connecting/querying
+        // the resolved server when one bootstrap address family is lost.
+        let bootstrap_budget = (time_limit / 2).min(BOOTSTRAP_QUERY_TIMEOUT);
         match &self.kind {
             Kind::Udp { target, dest } => {
-                let dest = cached_dest(dest, &self.spec, target).await?;
+                let dest = cached_dest(dest, &self.spec, target, bootstrap_budget).await?;
                 udp_exchange_addr(dest, q).await
             }
             Kind::Tcp { target, dest } => {
-                let dest = cached_dest(dest, &self.spec, target).await?;
+                let dest = cached_dest(dest, &self.spec, target, bootstrap_budget).await?;
                 let pool = self.tcp_pool.as_ref().expect("tcp pool");
                 tcp_exchange_pooled(pool, dest, q).await
             }
-            Kind::Tls {
-                target,
-                sni,
-                dest,
-            } => {
-                let dest = cached_dest(dest, &self.spec, target).await?;
+            Kind::Tls { target, sni, dest } => {
+                let dest = cached_dest(dest, &self.spec, target, bootstrap_budget).await?;
                 let connector = self.tls.as_ref().expect("tls connector");
                 let pool = self.tls_pool.as_ref().expect("tls pool");
                 tls_exchange_pooled(pool, connector, dest, sni, q).await
             }
             Kind::Doh { url } => {
+                if let Some(resolver) = &self.resolver {
+                    let (host, _) = url_host_port(url, 443)?;
+                    // Hyper's resolver callback does not receive this request's
+                    // deadline. Prime its shared cache within our own budget.
+                    resolver.resolve_host(&host, bootstrap_budget).await?;
+                }
                 let client = self.http.as_ref().expect("http client");
                 doh_exchange(client, url, q).await
             }
@@ -257,7 +267,10 @@ impl Upstream {
     }
 }
 
-fn build_http_client(spec: &UpstreamSpec, kind: &Kind) -> Result<reqwest::Client> {
+fn build_http_client(
+    spec: &UpstreamSpec,
+    kind: &Kind,
+) -> Result<(reqwest::Client, Option<Arc<PinResolver>>)> {
     let Kind::Doh { url } = kind else {
         unreachable!()
     };
@@ -267,17 +280,23 @@ fn build_http_client(spec: &UpstreamSpec, kind: &Kind) -> Result<reqwest::Client
         .http2_adaptive_window(true)
         .danger_accept_invalid_certs(spec.insecure);
 
-    if spec.dial_addr.is_some() || spec.bootstrap.is_some() {
+    let resolver = if spec.dial_addr.is_some() || spec.bootstrap.is_some() {
         let (host, port) = url_host_port(url, if url.starts_with("http://") { 80 } else { 443 })?;
-        builder = builder.dns_resolver(Arc::new(PinResolver::new(spec, &host, port)?));
-    }
+        let resolver = Arc::new(PinResolver::new(spec, &host, port)?);
+        builder = builder.dns_resolver(resolver.clone());
+        Some(resolver)
+    } else {
+        None
+    };
 
-    builder.build().map_err(|e| Error::Upstream {
+    let client = builder.build().map_err(|e| Error::Upstream {
         addr: spec.addr.clone(),
         message: e.to_string(),
-    })
+    })?;
+    Ok((client, resolver))
 }
 
+#[derive(Clone)]
 struct PinResolver {
     pins: Vec<SocketAddr>,
     bootstrap: Option<String>,
@@ -296,48 +315,38 @@ impl PinResolver {
             cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
+
+    async fn resolve_host(&self, host: &str, budget: Duration) -> Result<Vec<SocketAddr>> {
+        if !self.pins.is_empty() {
+            return Ok(self.pins.clone());
+        }
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(ip, 0)]);
+        }
+        if let Some(addrs) = self.cache.lock().get(host).cloned() {
+            return Ok(addrs);
+        }
+        let addrs: Vec<SocketAddr> = if let Some(boot) = &self.bootstrap {
+            let ips = bootstrap_ips(boot, host, budget).await?;
+            tracing::info!(host, bootstrap = %boot, n = ips.len(), "bootstrap resolved");
+            ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect()
+        } else {
+            tokio::net::lookup_host((host, 0)).await?.collect()
+        };
+        self.cache.lock().insert(host.to_string(), addrs.clone());
+        Ok(addrs)
+    }
 }
 
 impl reqwest::dns::Resolve for PinResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
-        let pins = self.pins.clone();
-        let bootstrap = self.bootstrap.clone();
-        let cache = self.cache.clone();
+        let resolver = self.clone();
         Box::pin(async move {
-            if !pins.is_empty() {
-                let iter: reqwest::dns::Addrs = Box::new(pins.into_iter());
-                return Ok(iter);
-            }
-            if let Some(addrs) = cache.lock().get(&host).cloned() {
-                let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
-                return Ok(iter);
-            }
-            let addrs = if let Some(boot) = bootstrap {
-                let ips = bootstrap_ips(&boot, &host)
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let addrs: Vec<SocketAddr> = ips
-                    .into_iter()
-                    .map(|ip| SocketAddr::new(ip, 0))
-                    .collect();
-                if addrs.is_empty() {
-                    return Err("bootstrap returned no addresses".into());
-                }
-                tracing::info!(
-                    host = %host,
-                    bootstrap = %boot,
-                    n = addrs.len(),
-                    "bootstrap resolved"
-                );
-                addrs
-            } else {
-                tokio::net::lookup_host((host.as_str(), 0))
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-                    .collect()
-            };
-            cache.lock().insert(host, addrs.clone());
+            let addrs = resolver
+                .resolve_host(&host, BOOTSTRAP_QUERY_TIMEOUT)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
             Ok(iter)
         })
@@ -348,15 +357,20 @@ async fn cached_dest(
     slot: &OnceLock<SocketAddr>,
     spec: &UpstreamSpec,
     target: &str,
+    bootstrap_budget: Duration,
 ) -> Result<SocketAddr> {
     if let Some(d) = slot.get() {
         return Ok(*d);
     }
-    let d = resolve_spec(spec, target).await?;
+    let d = resolve_spec(spec, target, bootstrap_budget).await?;
     Ok(*slot.get_or_init(|| d))
 }
 
-async fn resolve_spec(spec: &UpstreamSpec, target: &str) -> Result<SocketAddr> {
+async fn resolve_spec(
+    spec: &UpstreamSpec,
+    target: &str,
+    bootstrap_budget: Duration,
+) -> Result<SocketAddr> {
     if let Some(dial) = &spec.dial_addr {
         let port = port_of(target, 53);
         return parse_ip_port(dial, port);
@@ -370,7 +384,7 @@ async fn resolve_spec(spec: &UpstreamSpec, target: &str) -> Result<SocketAddr> {
         return Ok(sa);
     }
     if let Some(boot) = &spec.bootstrap {
-        let ips = bootstrap_ips(boot, &host).await?;
+        let ips = bootstrap_ips(boot, &host, bootstrap_budget).await?;
         let ip = *ips.first().ok_or_else(|| {
             Error::config(format!("bootstrap {boot} returned no addresses for {host}"))
         })?;
@@ -407,22 +421,40 @@ fn bootstrap_socket(s: &str) -> Result<SocketAddr> {
     parse_ip_port(s, 53)
 }
 
-async fn bootstrap_ips(bootstrap: &str, hostname: &str) -> Result<Vec<IpAddr>> {
+async fn bootstrap_ips(bootstrap: &str, hostname: &str, budget: Duration) -> Result<Vec<IpAddr>> {
     let boot = bootstrap_socket(bootstrap)?;
     let host = hostname.trim_end_matches('.');
-    let mut ips = Vec::new();
+    // Query both families concurrently, preserving partial success at the
+    // deadline. Retain IPv4 preference even when the AAAA answer arrives first.
+    let mut lookups = FuturesUnordered::new();
     for qtype in [RecordType::A, RecordType::AAAA] {
-        match bootstrap_query(boot, host, qtype).await {
-            Ok(list) => ips.extend(list),
-            Err(e) => tracing::debug!(err = %e, host, ?qtype, "bootstrap lookup"),
+        lookups.push(async move {
+            (
+                qtype,
+                timeout(
+                    budget.min(BOOTSTRAP_QUERY_TIMEOUT),
+                    bootstrap_query(boot, host, qtype),
+                )
+                .await,
+            )
+        });
+    }
+    let mut ips = Vec::new();
+    while let Some((qtype, result)) = lookups.next().await {
+        match result {
+            Ok(Ok(list)) => ips.extend(list),
+            Ok(Err(e)) => tracing::debug!(err = %e, host, ?qtype, "bootstrap lookup"),
+            Err(_) => tracing::debug!(host, ?qtype, "bootstrap lookup timeout"),
         }
     }
-    if ips.is_empty() {
-        return Err(Error::config(format!(
-            "bootstrap {bootstrap} could not resolve {hostname}"
-        )));
+    if !ips.is_empty() {
+        ips.sort_by_key(|ip| !ip.is_ipv4());
+        ips.dedup();
+        return Ok(ips);
     }
-    Ok(ips)
+    Err(Error::config(format!(
+        "bootstrap {bootstrap} could not resolve {hostname}"
+    )))
 }
 
 async fn bootstrap_query(boot: SocketAddr, name: &str, qtype: RecordType) -> Result<Vec<IpAddr>> {
@@ -431,8 +463,8 @@ async fn bootstrap_query(boot: SocketAddr, name: &str, qtype: RecordType) -> Res
     } else {
         format!("{name}.")
     };
-    let q = crate::context::build_query(&fqdn, qtype)
-        .map_err(|e| Error::protocol(e.to_string()))?;
+    let q =
+        crate::context::build_query(&fqdn, qtype).map_err(|e| Error::protocol(e.to_string()))?;
     let resp = udp_exchange_addr(boot, &q).await?;
     Ok(resp
         .answers()
@@ -508,7 +540,10 @@ fn normalize_hostport(rest: &str, default_port: u16) -> String {
 fn url_host_port(url: &str, default_port: u16) -> Result<(String, u16)> {
     let rest = url.split("://").nth(1).unwrap_or(url);
     let authority = rest.split('/').next().unwrap_or(rest);
-    Ok((host_of(authority), port_of(authority, default_port)))
+    Ok((
+        host_of(authority).to_ascii_lowercase(),
+        port_of(authority, default_port),
+    ))
 }
 
 async fn resolve_target(target: &str) -> Result<SocketAddr> {
@@ -527,13 +562,28 @@ async fn udp_exchange_addr(dest: SocketAddr, q: &Message) -> Result<Message> {
         "0.0.0.0:0".parse().unwrap()
     };
     let sock = UdpSocket::bind(bind).await?;
+    // Connected UDP filters unexpected source IPs and ports in the kernel.
+    sock.connect(dest).await?;
     let bytes = dnsutil::encode(q)?;
-    sock.send_to(&bytes, dest).await?;
+    sock.send(&bytes).await?;
     let mut buf = vec![0u8; 65535];
     for _ in 0..4 {
-        let (n, _) = sock.recv_from(&mut buf).await?;
-        let resp = dnsutil::decode(&buf[..n])?;
+        let n = sock.recv(&mut buf).await?;
+        let Ok(resp) = dnsutil::decode(&buf[..n]) else {
+            continue;
+        };
         if let Ok(ok) = dnsutil::take_response(q, resp) {
+            if ok.truncated() {
+                // Keep the original exchange deadline: this future is also
+                // used by bootstrap lookups and cancelled by their deadline.
+                let mut stream = TcpStream::connect(dest).await?;
+                stream.set_nodelay(true)?;
+                let full = framed_exchange(&mut stream, q).await?;
+                if full.truncated() {
+                    return Err(Error::protocol("truncated tcp response"));
+                }
+                return Ok(full);
+            }
             return Ok(ok);
         }
     }
@@ -714,9 +764,95 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn bootstrap_keeps_delayed_ipv4_after_fast_ipv6() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            let mut pending_a = None;
+            for _ in 0..2 {
+                let mut bytes = [0; 2048];
+                let (n, peer) = socket.recv_from(&mut bytes).await.unwrap();
+                let q = dnsutil::decode(&bytes[..n]).unwrap();
+                if q.queries()[0].query_type() == RecordType::A {
+                    pending_a = Some((q, peer));
+                } else {
+                    let mut r =
+                        dnsutil::reply_skeleton(&q, hickory_proto::op::ResponseCode::NoError);
+                    r.add_answer(dnsutil::record_aaaa(
+                        q.queries()[0].name().clone(),
+                        60,
+                        std::net::Ipv6Addr::LOCALHOST,
+                    ));
+                    socket
+                        .send_to(&dnsutil::encode(&r).unwrap(), peer)
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let (q, peer) = pending_a.unwrap();
+            let mut r = dnsutil::reply_skeleton(&q, hickory_proto::op::ResponseCode::NoError);
+            r.add_answer(dnsutil::record_a(
+                q.queries()[0].name().clone(),
+                60,
+                std::net::Ipv4Addr::LOCALHOST,
+            ));
+            socket
+                .send_to(&dnsutil::encode(&r).unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let addresses = bootstrap_ips(
+            &addr.to_string(),
+            "resolver.test",
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            addresses,
+            vec![
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            ]
+        );
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_ip_literal_never_queries_bootstrap_dns() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spec = UpstreamSpec {
+            addr: "https://127.0.0.1/dns-query".into(),
+            dial_addr: None,
+            bootstrap: Some(socket.local_addr().unwrap().to_string()),
+            idle_timeout: Duration::from_secs(10),
+            insecure: false,
+            tag: None,
+        };
+        let resolver = PinResolver::new(&spec, "127.0.0.1", 443).unwrap();
+        let addresses = resolver
+            .resolve_host("127.0.0.1", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            addresses,
+            vec!["127.0.0.1:0".parse::<SocketAddr>().unwrap()]
+        );
+        let mut bytes = [0; 512];
+        assert_eq!(
+            socket.try_recv_from(&mut bytes).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
     #[test]
     fn host_of_ipv6_and_hostport() {
-        assert_eq!(host_of("[2606:4700:4700::1111]:853"), "2606:4700:4700::1111");
+        assert_eq!(
+            host_of("[2606:4700:4700::1111]:853"),
+            "2606:4700:4700::1111"
+        );
         assert_eq!(host_of("2606:4700:4700::1111"), "2606:4700:4700::1111");
         assert_eq!(host_of("1.1.1.1:853"), "1.1.1.1");
         assert_eq!(host_of("dns.google"), "dns.google");

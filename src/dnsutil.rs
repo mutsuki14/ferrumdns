@@ -40,6 +40,14 @@ pub fn take_response(query: &Message, resp: Message) -> Result<Message> {
     if resp.id() != query.id() {
         return Err(Error::protocol("id mismatch"));
     }
+    if resp.op_code() != query.op_code() {
+        return Err(Error::protocol("opcode mismatch"));
+    }
+    // Name equality in hickory is DNS case-insensitive. Do not compare only
+    // the transaction ID: this validation is shared by every transport.
+    if resp.queries() != query.queries() {
+        return Err(Error::protocol("question mismatch"));
+    }
     Ok(resp)
 }
 
@@ -47,6 +55,7 @@ pub fn take_response(query: &Message, resp: Message) -> Result<Message> {
 /// upstream must not beat a slower NOERROR from another.
 pub fn is_usable_response(msg: &Message) -> bool {
     msg.message_type() == MessageType::Response
+        && !msg.truncated()
         && !matches!(
             msg.response_code(),
             ResponseCode::ServFail
@@ -231,9 +240,7 @@ pub fn parse_ecs_spec(s: &str) -> Result<ClientSubnet> {
         let ip: IpAddr = a
             .parse()
             .map_err(|e| Error::config(format!("bad ecs addr: {e}")))?;
-        let prefix: u8 = p
-            .parse()
-            .map_err(|_| Error::config("bad ecs prefix"))?;
+        let prefix: u8 = p.parse().map_err(|_| Error::config("bad ecs prefix"))?;
         (ip, prefix)
     } else {
         let ip: IpAddr = s
@@ -286,6 +293,35 @@ mod tests {
     }
 
     #[test]
+    fn take_response_checks_opcode_and_entire_question_tuple() {
+        let q = crate::context::build_query("example.com.", RecordType::A).unwrap();
+        let good = reply_skeleton(&q, ResponseCode::NoError);
+        let mut case_only = good.clone();
+        case_only.queries_mut()[0].set_name(Name::from_ascii("EXAMPLE.COM.").unwrap());
+        assert!(take_response(&q, case_only).is_ok());
+
+        let mut wrong_name = good.clone();
+        wrong_name.queries_mut()[0].set_name(Name::from_ascii("other.test.").unwrap());
+        let mut wrong_type = good.clone();
+        wrong_type.queries_mut()[0].set_query_type(RecordType::AAAA);
+        let mut wrong_class = good.clone();
+        wrong_class.queries_mut()[0].set_query_class(hickory_proto::rr::DNSClass::CH);
+        let mut wrong_opcode = good.clone();
+        wrong_opcode.set_op_code(OpCode::Status);
+        let mut missing_question = good;
+        missing_question.queries_mut().clear();
+        for response in [
+            wrong_name,
+            wrong_type,
+            wrong_class,
+            wrong_opcode,
+            missing_question,
+        ] {
+            assert!(take_response(&q, response).is_err());
+        }
+    }
+
+    #[test]
     fn usable_skips_servfail() {
         let mut m = Message::new();
         m.set_message_type(MessageType::Response);
@@ -297,6 +333,8 @@ mod tests {
         assert!(is_usable_response(&m));
         m.set_response_code(ResponseCode::NoError);
         assert!(is_usable_response(&m));
+        m.set_truncated(true);
+        assert!(!is_usable_response(&m));
     }
 
     #[test]
