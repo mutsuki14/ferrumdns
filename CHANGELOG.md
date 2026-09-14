@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### English
+
+- Remove the Docker deployment path, image recipe, container example and related CI/documentation. Supported installation paths are the native binary, Cargo and systemd.
+- Set the minimum Rust version to 1.88 and test both that version and stable against the locked dependencies.
+- Bound and parallelize TLS handshakes; preserve the DoH peer address; acquire current rules for each query on persistent TCP/DoT connections.
+- Validate upstream source and question identity, retry truncated UDP answers over TCP, and preserve usable partial bootstrap results.
+- Write only caches actually reached by a query; separate DNSSEC query modes and prevent request-specific EDNS data from leaking through cached responses.
+- Preserve original questions and CNAME chains during redirects; replay the initial pipeline context for lazy refresh.
+- Release replaced plugin registries, isolate fallback branches, and cancel losing or abandoned fallback work.
+- Reject cyclic includes and invalid configuration before serving; propagate listener failures; normalize entry references; keep working configuration on rejected reloads.
+- Validate TTL/ECS bounds, support zero-length ECS prefixes, ignore hosts inline comments, validate diagnostic client addresses, and honor file logging.
+
+### 简体中文
+
+- 删除 Docker 部署入口、镜像文件、容器示例和相关 CI/文档，保留原生二进制、Cargo、systemd 安装方式。
+- 最低 Rust 版本调整为 1.88；CI 使用该版本和 stable 分别验证锁定依赖。
+- TLS 握手增加并发和超时限制；DoH 保留来源地址；已有 TCP/DoT 连接的每条查询使用当前规则。
+- 校验上游响应来源及问题，UDP 截断后回退 TCP，Bootstrap 保留可用的部分结果。
+- 只回填实际执行过的缓存步骤，区分 DNSSEC 请求模式，防止客户端专属 EDNS 数据经缓存串用。
+- 重定向保留原始问题并补全 CNAME 链，lazy 刷新从流水线的初始上下文重放。
+- 释放旧插件注册表，隔离主备分支状态，取消落败或已被放弃的回退任务。
+- 在服务启动前拒绝循环 include 和非法配置；传播监听失败；统一入口名称；重载失败时保留旧配置。
+- 校验 TTL/ECS 边界，支持 ECS /0，正确处理 Hosts 行内注释，校验诊断接口来源地址，并实现文件日志。
+
 ## [0.1.1] — 2026-09-02
 
 Cache-poisoning and pipeline-entry fixes found after the 0.1.0 review.

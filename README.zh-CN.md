@@ -18,7 +18,6 @@
 - [安装](#安装)
   - [系统二进制](#系统二进制)
   - [无需 root](#无需-root)
-  - [Docker](#docker)
   - [systemd](#systemd)
 - [使用说明](#使用说明)
   - [快速开始](#快速开始)
@@ -60,7 +59,7 @@ v0.1.1。首个 tag 是 0.1.0。已交付：lazy 缓存后台刷新、bootstrap 
 
 ## 安装
 
-二进制从 [GitHub Releases](https://github.com/mutsuki14/ferrumdns/releases/latest) 下载，或从源码编译（Rust 1.80+，见 [rustup](https://rustup.rs)）。先克隆仓库，再选 **一种** 安装方式。
+二进制从 [GitHub Releases](https://github.com/mutsuki14/ferrumdns/releases/latest) 下载，或从源码编译（Rust 1.88+，见 [rustup](https://rustup.rs)）。先克隆仓库，再选 **一种** 安装方式。
 
 ```sh
 git clone https://github.com/mutsuki14/ferrumdns.git
@@ -72,7 +71,7 @@ cd ferrumdns
 绑定 `:53`。需要 root 或 `CAP_NET_BIND_SERVICE`（[systemd 单元](systemd/ferrumdns.service) 已经带上该能力）。
 
 ```sh
-cargo build --release
+cargo build --release --locked
 sudo install -m 0755 target/release/ferrumdns /usr/local/bin/ferrumdns
 sudo mkdir -p /etc/ferrumdns
 sudo cp examples/simple.yaml /etc/ferrumdns/config.yaml
@@ -100,26 +99,6 @@ dig @127.0.0.1 -p 5353 router.lan
 curl -s http://127.0.0.1:9090/api/stats
 ```
 
-### Docker
-
-镜像内置 `examples/docker.yaml`（管理 API 听 `0.0.0.0:9090`，映射 9090 即可访问）。**不要**挂载一个还不存在的宿主机路径 — Docker 会在那里创建一个目录，进程读配置会失败。
-
-```sh
-docker build -t ferrumdns .
-docker run --rm --name ferrumdns \
-  -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
-  ferrumdns
-```
-
-覆盖内置配置时，挂载一个已经存在的文件：
-
-```sh
-docker run --rm --name ferrumdns \
-  -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
-  -v "$PWD/examples/docker.yaml:/etc/ferrumdns/config.yaml:ro" \
-  ferrumdns
-```
-
 ### systemd
 
 ```sh
@@ -143,7 +122,6 @@ sudo systemctl reload ferrumdns   # SIGHUP — 换插件，套接字不关
 |---|---|---|---|
 | [`examples/simple.yaml`](examples/simple.yaml) | `0.0.0.0:53` | `127.0.0.1:9090` | 本机 / systemd |
 | [`examples/dev.yaml`](examples/dev.yaml) | `127.0.0.1:5353` | `127.0.0.1:9090` | `cargo run`，无需 root |
-| [`examples/docker.yaml`](examples/docker.yaml) | `0.0.0.0:53` | `0.0.0.0:9090` | 容器 |
 | [`examples/split-horizon.yaml`](examples/split-horizon.yaml) | `0.0.0.0:53` | `127.0.0.1:9090` | 广告拦截 + 国内分流 + fallback |
 
 YAML 里的 `files:` 相对该文件所在目录解析，所以在仓库根目录执行 `ferrumdns check -c examples/split-horizon.yaml` 即可。
@@ -283,6 +261,8 @@ Matcher：`qname $set`、`qtype A AAAA`、`client_ip $set`、`resp_ip $set`、`h
 
 管理口 `POST /api/query` 可带 `"ecs": "203.0.113.0/24"` 和 `"client_ip": "8.8.8.8"` 做回放。
 
+`mask4` 接受 `0–32`，`mask6` 接受 `0–128`；`0` 会发送不含地址位的 `/0` 前缀。越界或非整数配置会在启动前报错。
+
 ### 上游
 
 ```
@@ -327,7 +307,13 @@ servers:
         url_path: /dns-query
 ```
 
-SIGHUP（`systemctl reload ferrumdns` / `kill -HUP $pid`）从同一份配置重建插件。改监听地址或证书路径仍需重启。
+DoH 的 `client_ip` 匹配和自动 ECS 使用直接连接的客户端 IP。经反向代理访问时，该地址是代理 IP；不会读取 `X-Forwarded-For`。
+
+SIGHUP（`systemctl reload ferrumdns` / `kill -HUP $pid`）从同一份配置重建插件，已有 TCP/DoT 连接的下一条查询也会使用新规则。无效配置保留当前运行版本。监听器、入口、API 或日志配置的变更需要重启；TLS 证书内容更新同样需要重启。
+
+`ferrumdns check -c config.yaml` 校验插件引用、循环依赖、监听协议、地址和 TLS 文件。实际启动时，只要任一监听器或 API 绑定失败，进程就会以非零状态退出。
+
+`log.file` 可选；配置后日志追加到该文件，相对路径以配置文件所在目录为基准。父目录需要预先存在；不配置时日志输出到终端。
 
 ### 兼容性
 
@@ -377,6 +363,8 @@ curl -s -X POST http://127.0.0.1:9090/api/query \
 欢迎 Issue 和 Pull Request。
 
 提交补丁前请运行 `cargo test --all`。
+
+本次检查问题与回归测试的对应关系见 [修复记录](docs/audit-fixes.md)。
 
 若修改 README，请遵循 [standard-readme](https://github.com/RichardLitt/standard-readme) 规范，并同步更新 [README.md](README.md) 与 [README.zh-CN.md](README.zh-CN.md)。
 

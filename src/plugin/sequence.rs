@@ -7,13 +7,12 @@ use crate::dnsutil;
 use crate::error::{Error, Result};
 use crate::matcher::Matcher;
 use crate::plugin::actions::Builtin;
-use crate::plugin::cache::Cache;
+use crate::plugin::cache::{Cache, CacheLookup};
 use crate::plugin::{Action, Executable, Registry};
 
 pub struct Sequence {
     pub tag: String,
     steps: Vec<Step>,
-    caches: Vec<Arc<Cache>>,
 }
 
 struct Step {
@@ -88,14 +87,15 @@ fn parse_exec(s: &str) -> Result<Exec> {
 }
 
 pub fn bind_matcher(expr: &str, reg: &Registry) -> Result<Matcher> {
-    let expr = expr.trim();
-    if let Some(rest) = expr.strip_prefix('!') {
-        let inner = bind_matcher(rest.trim(), reg)?;
-        return Ok(Matcher::Neg(Box::new(inner)));
+    let mut expr = expr.trim();
+    let mut negate = false;
+    while let Some(rest) = expr.strip_prefix('!') {
+        negate = !negate;
+        expr = rest.trim_start();
     }
     let mut parts = expr.split_whitespace();
     let head = parts.next().unwrap_or("");
-    match head {
+    let matcher = match head {
         "has_resp" => Ok(Matcher::HasResp),
         "has_wanted_ans" => Ok(Matcher::HasWantedAns),
         "qname" => {
@@ -150,13 +150,16 @@ pub fn bind_matcher(expr: &str, reg: &Registry) -> Result<Matcher> {
         }
         "ecs" | "has_ecs" => Ok(Matcher::HasEcs),
         other => Err(Error::config(format!("unknown matcher `{other}`"))),
-    }
+    }?;
+    Ok(if negate {
+        Matcher::Neg(Box::new(matcher))
+    } else {
+        matcher
+    })
 }
 
 pub fn compile_steps(tag: &str, raw: Vec<RawStep>, reg: &Registry) -> Result<Sequence> {
     let mut steps = Vec::new();
-    let mut caches = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     for r in raw {
         let matchers = r
             .matches
@@ -164,25 +167,18 @@ pub fn compile_steps(tag: &str, raw: Vec<RawStep>, reg: &Registry) -> Result<Seq
             .map(|s| bind_matcher(s, reg))
             .collect::<Result<Vec<_>>>()?;
         let exec = parse_exec(&r.exec)?;
-        if let Exec::Plugin(ref tag) = exec {
-            if let Some(c) = reg.caches.get(tag) {
-                if seen.insert(tag.clone()) {
-                    caches.push(c.clone());
-                }
-            }
-        }
         steps.push(Step { matchers, exec });
     }
     Ok(Sequence {
         tag: tag.to_string(),
         steps,
-        caches,
     })
 }
 
 impl Sequence {
     pub async fn run(&self, ctx: &mut QueryContext, reg: &Registry) -> Result<Action> {
         let mut i = 0;
+        let mut cache_writes = Vec::new();
         while i < self.steps.len() {
             let ok = self.steps[i].matchers.iter().all(|m| m.matches(ctx));
             if !ok {
@@ -192,6 +188,11 @@ impl Sequence {
             let action = match &self.steps[i].exec {
                 Exec::Plugin(tag) => {
                     let p = reg.get_exec(tag)?;
+                    if let Some(cache) = reg.caches.get(tag) {
+                        if let Some(lookup) = cache.snapshot(ctx) {
+                            cache_writes.push((cache.clone(), lookup));
+                        }
+                    }
                     ctx.push_trace(&self.tag, "exec", tag);
                     p.exec(ctx).await?
                 }
@@ -203,28 +204,33 @@ impl Sequence {
             match action {
                 Action::Continue => i += 1,
                 Action::Accept => {
-                    self.store(ctx);
+                    Self::store(ctx, &cache_writes);
                     return Ok(Action::Accept);
                 }
                 Action::Return => {
-                    self.store(ctx);
+                    Self::store(ctx, &cache_writes);
                     return Ok(Action::Continue);
                 }
                 Action::Goto(tag) => {
                     let p = reg.get_exec(&tag)?;
+                    if let Some(cache) = reg.caches.get(&tag) {
+                        if let Some(lookup) = cache.snapshot(ctx) {
+                            cache_writes.push((cache.clone(), lookup));
+                        }
+                    }
                     let a = p.exec(ctx).await?;
-                    self.store(ctx);
+                    Self::store(ctx, &cache_writes);
                     return Ok(a);
                 }
             }
         }
-        self.store(ctx);
+        Self::store(ctx, &cache_writes);
         Ok(Action::Continue)
     }
 
-    fn store(&self, ctx: &QueryContext) {
-        for c in &self.caches {
-            c.maybe_store(ctx);
+    fn store(ctx: &QueryContext, writes: &[(Arc<Cache>, CacheLookup)]) {
+        for (cache, lookup) in writes {
+            cache.store_lookup(ctx, lookup);
         }
     }
 }

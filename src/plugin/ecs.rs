@@ -41,16 +41,8 @@ impl Ecs {
                 "ecs plugin needs `ipv4`/`ipv6` or `auto: true`",
             ));
         }
-        let mask4 = args
-            .get("mask4")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(24)
-            .clamp(1, 32) as u8;
-        let mask6 = args
-            .get("mask6")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(48)
-            .clamp(1, 128) as u8;
+        let mask4 = parse_mask(args, "mask4", 24, 32)?;
+        let mask6 = parse_mask(args, "mask6", 48, 128)?;
         Ok(Arc::new(Self {
             tag: tag.to_string(),
             auto,
@@ -134,6 +126,18 @@ impl Executable for NoEcs {
         ctx.strip_ecs_on_reply = true;
         ctx.push_trace(&self.tag, "strip", "query");
         Ok(Action::Continue)
+    }
+}
+
+fn parse_mask(args: &serde_yaml::Value, key: &str, default: u8, maximum: u8) -> Result<u8> {
+    match args.get(key) {
+        None => Ok(default),
+        Some(value) => match value.as_u64() {
+            Some(n) if n <= u64::from(maximum) => Ok(n as u8),
+            _ => Err(Error::config(format!(
+                "ecs {key} must be an integer in 0..={maximum}"
+            ))),
+        },
     }
 }
 
@@ -277,10 +281,7 @@ mod tests {
     #[tokio::test]
     async fn no_ecs_strips() {
         let mut q = build_query("ecs.test.", RecordType::A).unwrap();
-        dnsutil::set_ecs(
-            &mut q,
-            ClientSubnet::new("8.8.8.0".parse().unwrap(), 24, 0),
-        );
+        dnsutil::set_ecs(&mut q, ClientSubnet::new("8.8.8.0".parse().unwrap(), 24, 0));
         let mut ctx = QueryContext::new(q, None, ClientProto::Udp);
         NoEcs::new("no_ecs").exec(&mut ctx).await.unwrap();
         assert!(dnsutil::ecs_of(ctx.query()).is_none());

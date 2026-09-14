@@ -22,7 +22,7 @@ pub struct Config {
     pub base_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -54,7 +54,7 @@ pub struct PluginConfig {
     pub base_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
     /// Sequence / plugin tag that handles queries.
     #[serde(default, alias = "entry")]
@@ -70,7 +70,7 @@ fn default_timeout() -> u64 {
     5
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ListenerConfig {
     /// udp | tcp | tls | dot | https | doh | http
     #[serde(default = "default_proto")]
@@ -93,7 +93,7 @@ fn default_proto() -> String {
     "udp".into()
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct ApiConfig {
     /// Bind address for the HTTP admin API, e.g. `127.0.0.1:9090`.
     #[serde(default)]
@@ -118,10 +118,40 @@ impl Config {
         let mut cfg: Config =
             serde_yaml::from_str(text).map_err(|e| Error::config(format!("yaml parse: {e}")))?;
         cfg.lift_server_plugins()?;
+        cfg.normalize_entries()?;
         Ok(cfg)
     }
 
     pub fn load_file(path: &Path) -> Result<Self> {
+        Self::load_with_stack(path, &mut Vec::new())
+    }
+
+    fn load_with_stack(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Self> {
+        const MAX_INCLUDE_DEPTH: usize = 64;
+        if stack.len() >= MAX_INCLUDE_DEPTH {
+            return Err(Error::config(format!(
+                "include depth exceeds {MAX_INCLUDE_DEPTH} at {}",
+                path.display()
+            )));
+        }
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| Error::config(format!("resolve {}: {e}", path.display())))?;
+        if stack.contains(&canonical) {
+            let chain = stack
+                .iter()
+                .chain(std::iter::once(&canonical))
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            return Err(Error::config(format!("include cycle: {chain}")));
+        }
+        stack.push(canonical);
+        let result = Self::load_contents(path, stack);
+        stack.pop();
+        result
+    }
+
+    fn load_contents(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::config(format!("read {}: {e}", path.display())))?;
         let mut cfg = Self::from_yaml(&text)?;
@@ -134,13 +164,16 @@ impl Config {
         let includes = cfg.include.clone();
         for rel in includes {
             let p = resolve_path(&cfg.base_dir, &rel);
-            let extra = Self::load_file(&p)?;
+            let extra = Self::load_with_stack(&p, stack)?;
             cfg.merge(extra);
         }
         Ok(cfg)
     }
 
     fn stamp_base(&mut self) {
+        if let Some(file) = &self.log.file {
+            self.log.file = Some(resolve_path(&self.base_dir, file).display().to_string());
+        }
         for p in &mut self.plugins {
             if p.base_dir.as_os_str().is_empty() {
                 p.base_dir = self.base_dir.clone();
@@ -156,6 +189,19 @@ impl Config {
                 }
             }
         }
+    }
+
+    /// Both supported server syntaxes accept the same optional `$` prefix.
+    pub(crate) fn normalize_entries(&mut self) -> Result<()> {
+        for server in &mut self.servers {
+            let raw = server.exec.trim();
+            let entry = raw.trim_start_matches('$');
+            if (!raw.is_empty() && entry.is_empty()) || entry.chars().any(char::is_whitespace) {
+                return Err(Error::config(format!("invalid server entry `{raw}`")));
+            }
+            server.exec = entry.to_string();
+        }
+        Ok(())
     }
 
     fn merge(&mut self, other: Config) {
@@ -185,13 +231,8 @@ impl Config {
                         .or_else(|| p.args.get("exec"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
-                        .trim_start_matches('$')
                         .to_string();
-                    let listen = match p
-                        .args
-                        .get("listen")
-                        .or_else(|| p.args.get("addr"))
-                    {
+                    let listen = match p.args.get("listen").or_else(|| p.args.get("addr")) {
                         Some(Value::String(s)) => s.clone(),
                         Some(_) => {
                             return Err(Error::config(
@@ -200,11 +241,7 @@ impl Config {
                         }
                         None => "0.0.0.0:53".into(),
                     };
-                    let timeout = p
-                        .args
-                        .get("timeout")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(5);
+                    let timeout = p.args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(5);
                     self.servers.push(ServerConfig {
                         exec: entry,
                         timeout,
@@ -231,8 +268,12 @@ impl Config {
                             workers: p
                                 .args
                                 .get("workers")
-                                .and_then(|v| v.as_u64())
-                                .map(|n| n as u32),
+                                .map(|v| {
+                                    v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(
+                                        || Error::config("server workers must be a u32"),
+                                    )
+                                })
+                                .transpose()?,
                         }],
                     });
                 }

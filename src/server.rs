@@ -1,10 +1,13 @@
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::connect_info::Connected;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::Router;
 use base64::Engine;
+use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt};
 use hickory_proto::op::ResponseCode;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
@@ -14,6 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ListenerConfig;
@@ -23,12 +28,68 @@ use crate::error::{Error, Result};
 use crate::plugin::Action;
 use crate::runtime::{Live, Runtime};
 
+const MAX_TLS_HANDSHAKES: usize = 128;
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Validate listener settings during `check` / runtime construction without
+/// binding sockets. Certificate errors must not first appear in a serve task.
+pub(crate) fn validate_listener(l: &ListenerConfig) -> Result<()> {
+    l.addr
+        .parse::<SocketAddr>()
+        .map_err(|e| Error::config(format!("bad listen addr {}: {e}", l.addr)))?;
+    let protocol = l.protocol.to_ascii_lowercase();
+    match protocol.as_str() {
+        "udp" | "" | "tcp" => {}
+        "tls" | "dot" => {
+            let cert = l
+                .cert
+                .as_deref()
+                .ok_or_else(|| Error::config("tls listener needs cert"))?;
+            let key = l
+                .key
+                .as_deref()
+                .ok_or_else(|| Error::config("tls listener needs key"))?;
+            tls_acceptor(cert, key, &[])?;
+        }
+        "doh" | "https" | "http" => {
+            let path = l.url_path.as_deref().unwrap_or("/dns-query");
+            let uri = path
+                .parse::<Uri>()
+                .map_err(|e| Error::config(format!("bad doh path: {e}")))?;
+            if !path.starts_with('/')
+                || uri.path() != path
+                || uri.query().is_some()
+                || path.contains(['{', '}', '*', '#'])
+                || path.split('/').any(|segment| segment.starts_with(':'))
+            {
+                return Err(Error::config(
+                    "doh url_path must be a fixed absolute URL path",
+                ));
+            }
+            match (l.cert.as_deref(), l.key.as_deref()) {
+                (Some(cert), Some(key)) => {
+                    tls_acceptor(cert, key, &[b"h2", b"http/1.1"])?;
+                }
+                (None, None) => {}
+                _ => return Err(Error::config("doh https needs both cert and key")),
+            }
+        }
+        other => {
+            return Err(Error::config(format!(
+                "unknown listener protocol `{other}`"
+            )))
+        }
+    }
+    Ok(())
+}
+
 pub async fn spawn_listener(
     live: Live,
     entry: String,
     timeout: Duration,
     l: ListenerConfig,
 ) -> Result<()> {
+    validate_listener(&l)?;
     let proto = l.protocol.to_ascii_lowercase();
     let idle = Duration::from_secs(l.idle_timeout.unwrap_or(10).max(1));
     match proto.as_str() {
@@ -59,7 +120,9 @@ pub async fn spawn_listener(
             .await
         }
         "doh" | "https" | "http" => spawn_doh(live, entry, timeout, l).await,
-        other => Err(Error::config(format!("unknown listener protocol `{other}`"))),
+        other => Err(Error::config(format!(
+            "unknown listener protocol `{other}`"
+        ))),
     }
 }
 
@@ -81,17 +144,23 @@ async fn spawn_udp(
 ) -> Result<()> {
     let n = workers.max(1);
     tracing::info!(%addr, entry = %entry, workers = n, "udp listen");
-    let mut handles = Vec::with_capacity(n);
-    for i in 0..n {
-        let sock = bind_udp(&addr)?;
+    // Bind everything before spawning workers: partial startup failure must
+    // not leave detached listeners behind. JoinSet also aborts on cancellation.
+    let sockets = (0..n)
+        .map(|_| bind_udp(&addr))
+        .collect::<Result<Vec<_>>>()?;
+    let mut handles = JoinSet::new();
+    for (i, sock) in sockets.into_iter().enumerate() {
         let live = live.clone();
         let entry = entry.clone();
-        handles.push(tokio::spawn(async move {
+        handles.spawn(async move {
             udp_loop(live, entry, timeout, sock).await;
-        }));
+        });
         tracing::debug!(worker = i, %addr, "udp worker bound");
     }
-    futures::future::join_all(handles).await;
+    while let Some(result) = handles.join_next().await {
+        result.map_err(|e| Error::protocol(format!("udp worker failed: {e}")))?;
+    }
     Ok(())
 }
 
@@ -176,6 +245,7 @@ async fn spawn_tcp(
     tls: Option<TlsAcceptor>,
 ) -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
+    let handshake_slots = Arc::new(Semaphore::new(MAX_TLS_HANDSHAKES));
     tracing::info!(%addr, proto = proto.as_str(), entry = %entry, "stream listen");
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -188,21 +258,38 @@ async fn spawn_tcp(
         let live = live.clone();
         let entry = entry.clone();
         let tls = tls.clone();
+        let handshake_permit = if tls.is_some() {
+            match handshake_slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
         tokio::spawn(async move {
-            let rt = live.get();
             let result = async {
                 if let Some(acc) = tls {
-                    let mut tls = acc
-                        .accept(stream)
-                        .await
-                        .map_err(|e| Error::protocol(e.to_string()))?;
-                    serve_framed(&rt, &entry, timeout, idle, proto, Some(peer.ip()), &mut tls)
-                        .await
+                    let mut tls =
+                        tokio::time::timeout(idle.min(TLS_HANDSHAKE_TIMEOUT), acc.accept(stream))
+                            .await
+                            .map_err(|_| Error::protocol("tls handshake timeout"))?
+                            .map_err(|e| Error::protocol(e.to_string()))?;
+                    drop(handshake_permit);
+                    serve_framed(
+                        &live,
+                        &entry,
+                        timeout,
+                        idle,
+                        proto,
+                        Some(peer.ip()),
+                        &mut tls,
+                    )
+                    .await
                 } else {
                     let mut stream = stream;
                     let _ = stream.set_nodelay(true);
                     serve_framed(
-                        &rt,
+                        &live,
                         &entry,
                         timeout,
                         idle,
@@ -221,7 +308,7 @@ async fn spawn_tcp(
 }
 
 async fn serve_framed<S: AsyncReadExt + AsyncWriteExt + Unpin>(
-    rt: &Runtime,
+    live: &Live,
     entry: &str,
     timeout: Duration,
     idle: Duration,
@@ -257,7 +344,8 @@ async fn serve_framed<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             Incoming::Ok => {}
         }
         let mut ctx = QueryContext::new(q, peer, proto);
-        handle(rt, entry, &mut ctx, timeout).await?;
+        let rt = live.get();
+        handle(&rt, entry, &mut ctx, timeout).await?;
         write_tcp_response(stream, idle, &ctx).await?;
     }
 }
@@ -315,17 +403,29 @@ async fn spawn_doh(live: Live, entry: String, timeout: Duration, l: ListenerConf
             let acceptor = tls_acceptor(cert, key, &[b"h2", b"http/1.1"])?;
             let listener = TcpListener::bind(addr).await?;
             tracing::info!(%addr, path = %path, "doh listen (https)");
-            let incoming = TlsIncoming { listener, acceptor };
-            axum::serve(incoming, app)
-                .await
-                .map_err(|e| Error::config(e.to_string()))
+            let incoming = TlsIncoming {
+                listener,
+                acceptor,
+                handshakes: FuturesUnordered::new(),
+                handshake_timeout: Duration::from_secs(l.idle_timeout.unwrap_or(10).max(1))
+                    .min(TLS_HANDSHAKE_TIMEOUT),
+            };
+            axum::serve(
+                incoming,
+                app.into_make_service_with_connect_info::<PeerAddress>(),
+            )
+            .await
+            .map_err(|e| Error::config(e.to_string()))
         }
         (None, None) => {
             tracing::info!(%addr, path = %path, "doh listen (http)");
             let listener = TcpListener::bind(addr).await?;
-            axum::serve(listener, app)
-                .await
-                .map_err(|e| Error::config(e.to_string()))
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<PeerAddress>(),
+            )
+            .await
+            .map_err(|e| Error::config(e.to_string()))
         }
         _ => Err(Error::config(
             "doh https needs both cert and key (omit both for plaintext behind a TLS terminator)",
@@ -337,6 +437,25 @@ async fn spawn_doh(live: Live, entry: String, timeout: Duration, l: ListenerConf
 struct TlsIncoming {
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    handshakes: FuturesUnordered<
+        BoxFuture<'static, Result<(tokio_rustls::server::TlsStream<TcpStream>, SocketAddr)>>,
+    >,
+    handshake_timeout: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct PeerAddress(SocketAddr);
+
+impl Connected<axum::serve::IncomingStream<'_, TcpListener>> for PeerAddress {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TcpListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+impl Connected<axum::serve::IncomingStream<'_, TlsIncoming>> for PeerAddress {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TlsIncoming>) -> Self {
+        Self(*stream.remote_addr())
+    }
 }
 
 impl axum::serve::Listener for TlsIncoming {
@@ -345,17 +464,37 @@ impl axum::serve::Listener for TlsIncoming {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (stream, addr) = match self.listener.accept().await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!(err = %e, "doh tcp accept");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
+            tokio::select! {
+                // Drain completed handshakes before admitting more sockets.
+                biased;
+                Some(result) = self.handshakes.next(), if !self.handshakes.is_empty() => {
+                    match result {
+                        Ok(connection) => return connection,
+                        Err(e) => tracing::debug!(err = %e, "doh tls handshake"),
+                    }
                 }
-            };
-            match self.acceptor.accept(stream).await {
-                Ok(tls) => return (tls, addr),
-                Err(e) => tracing::debug!(err = %e, "doh tls handshake"),
+                accepted = self.listener.accept() => {
+                    let (stream, addr) = match accepted {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::debug!(err = %e, "doh tcp accept");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    };
+                    if self.handshakes.len() >= MAX_TLS_HANDSHAKES {
+                        continue;
+                    }
+                    let acceptor = self.acceptor.clone();
+                    let deadline = self.handshake_timeout;
+                    self.handshakes.push(Box::pin(async move {
+                        let stream = tokio::time::timeout(deadline, acceptor.accept(stream))
+                            .await
+                            .map_err(|_| Error::protocol("tls handshake timeout"))?
+                            .map_err(|e| Error::protocol(e.to_string()))?;
+                        Ok((stream, addr))
+                    }));
+                }
             }
         }
     }
@@ -365,15 +504,24 @@ impl axum::serve::Listener for TlsIncoming {
     }
 }
 
-async fn doh_post(State(st): State<DohState>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
-    doh_handle(&st, headers, body).await
+async fn doh_post(
+    State(st): State<DohState>,
+    ConnectInfo(peer): ConnectInfo<PeerAddress>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    doh_handle(&st, peer.0, headers, body).await
 }
 
-async fn doh_get(State(st): State<DohState>, uri: Uri) -> impl IntoResponse {
+async fn doh_get(
+    State(st): State<DohState>,
+    ConnectInfo(peer): ConnectInfo<PeerAddress>,
+    uri: Uri,
+) -> impl IntoResponse {
     let Some(raw) = uri.query().and_then(dns_query_param) else {
         return (StatusCode::BAD_REQUEST, "missing dns= parameter").into_response();
     };
-    doh_handle(&st, HeaderMap::new(), Bytes::from(raw)).await
+    doh_handle(&st, peer.0, HeaderMap::new(), Bytes::from(raw)).await
 }
 
 fn dns_query_param(query: &str) -> Option<Vec<u8>> {
@@ -403,10 +551,9 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(b) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(b as char);
                 i += 3;
                 continue;
@@ -418,14 +565,19 @@ fn percent_decode(s: &str) -> String {
     out
 }
 
-async fn doh_handle(st: &DohState, _headers: HeaderMap, body: Bytes) -> axum::response::Response {
+async fn doh_handle(
+    st: &DohState,
+    peer: SocketAddr,
+    _headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
     let q = match dnsutil::decode(&body) {
         Ok(m) => m,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     };
-    let mut ctx = QueryContext::new(q, None, ClientProto::Https);
+    let mut ctx = QueryContext::new(q, Some(peer.ip()), ClientProto::Https);
     let rt = st.live.get();
     if let Err(e) = handle(&rt, &st.entry, &mut ctx, st.timeout).await {
         return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
@@ -491,9 +643,7 @@ pub async fn handle(
             ctx.reject(ResponseCode::NotImp);
         }
         Incoming::Ok => {
-            if ctx.pipeline_entry.is_none() {
-                ctx.pipeline_entry = Some(entry.to_string());
-            }
+            ctx.begin_pipeline(entry);
             let exec = rt.registry.get_exec(entry)?;
             match tokio::time::timeout(timeout, exec.exec(ctx)).await {
                 Ok(Ok(Action::Continue | Action::Accept | Action::Return | Action::Goto(_))) => {}
@@ -509,6 +659,7 @@ pub async fn handle(
             }
         }
     }
+    ctx.finalize_response();
     if ctx.strip_ecs_on_reply {
         if let Some(resp) = ctx.response_mut() {
             dnsutil::remove_ecs(resp);

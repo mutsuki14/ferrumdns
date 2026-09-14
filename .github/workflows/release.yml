@@ -16,7 +16,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: test
-        run: cargo test --all
+        run: cargo test --all --locked
       - name: build
         run: cargo build --release --locked
       - name: pack
