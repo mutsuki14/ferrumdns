@@ -3,6 +3,7 @@
 #   cargo run -- start -c examples/dev.yaml
 #   dig @127.0.0.1 -p 5353 router.lan
 #   curl -s http://127.0.0.1:9090/api/stats
+#   Web console: http://127.0.0.1:9090/
 log:
   level: info
 
