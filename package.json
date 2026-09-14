@@ -1,0 +1,18 @@
+{
+  "name": "ferrumdns-console-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Development checks for the embedded console. Node.js is not needed to build or run FerrumDNS.",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "scripts": {
+    "test": "node --test tests/web_*.test.mjs",
+    "format": "prettier --write web tests/web_*.test.mjs",
+    "format:check": "prettier --check web tests/web_*.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "30.0.1",
+    "prettier": "3.9.6"
+  }
+}

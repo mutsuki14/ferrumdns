@@ -21,6 +21,7 @@ Inspired by [mosdns-x](https://github.com/pmkol/mosdns-x) — same mental model 
   - [systemd](#systemd)
 - [Usage](#usage)
   - [Quick start](#quick-start)
+  - [Web console](#web-console)
   - [Architecture](#architecture)
   - [Plugins](#plugins)
   - [EDNS Client Subnet](#edns-client-subnet)
@@ -200,6 +201,18 @@ Save that as `config.yaml` and run `ferrumdns check -c config.yaml && ferrumdns 
 
 `examples/dev.yaml` binds `127.0.0.1:5353` so this does not need root. `examples/simple.yaml` binds `:53` and will fail with `permission denied` as a normal user.
 
+### Web console
+
+The console is embedded in the FerrumDNS binary and shares the admin API port. No separate frontend deployment or Node.js installation is needed to build or run the service.
+
+```sh
+cargo run --locked -- start -c examples/dev.yaml
+```
+
+Open `http://127.0.0.1:9090/`. The Chinese-language console includes a live overview, sampled query-rate chart, DNS queries with pipeline traces, searchable plugins, cache flushing, and read-only listener/upstream configuration. Polling runs every three seconds and can be paused. Query history stays in the current page's memory.
+
+The console uses the existing admin API access model and has no built-in login. Keep the admin listener on loopback; use SSH forwarding or an authenticated reverse proxy for remote access. See the [console guide](docs/web-console.md) for details and development checks.
+
 ### Architecture
 
 ```
@@ -340,9 +353,10 @@ Bind with `api.http`.
 | GET | `/health` | Liveness |
 | GET | `/metrics` | Prometheus text |
 | GET | `/api/stats` | JSON counters |
+| GET | `/api/system` | Version, runtime ID, listeners, plugins and sanitized upstream summaries |
 | GET | `/api/plugins` | Loaded tags |
 | POST | `/api/query` | `{ "name", "qtype", "entry?", "ecs?", "client_ip?" }` — debug a query with a pipeline trace |
-| POST | `/api/cache/flush` | Drop the LRU |
+| POST | `/api/cache/flush` | `{"tag":"cache"}` flushes one cache; an empty request or `{}` flushes all |
 
 ```sh
 cargo test --all

@@ -21,6 +21,7 @@
   - [systemd](#systemd)
 - [使用说明](#使用说明)
   - [快速开始](#快速开始)
+  - [Web 管理界面](#web-管理界面)
   - [架构](#架构)
   - [插件](#插件)
   - [EDNS Client Subnet](#edns-client-subnet)
@@ -200,6 +201,18 @@ plugins:
 
 `examples/dev.yaml` 绑定 `127.0.0.1:5353`，无需 root。`examples/simple.yaml` 绑定 `:53`，普通用户会得到 `permission denied`。
 
+### Web 管理界面
+
+控制台内嵌在 FerrumDNS 二进制中，与管理 API 共用端口，无需单独部署前端，也不需要 Node.js 才能编译或运行。
+
+```sh
+cargo run --locked -- start -c examples/dev.yaml
+```
+
+浏览器打开 `http://127.0.0.1:9090/`。控制台提供中文运行概览、真实查询趋势、DNS 查询与流水线追踪、插件筛选、缓存清理以及只读监听和上游配置。页面每 3 秒刷新，支持暂停；查询历史仅保留在当前页面内存中。
+
+管理端口沿用现有 API 的访问控制，没有内置登录。保持回环监听；远程使用时通过 SSH 转发或带认证的反向代理访问。详细操作及开发检查见 [Web 控制台说明](docs/web-console.md)。
+
 ### 架构
 
 ```
@@ -340,9 +353,10 @@ FerrumDNS 接受 **mosdns v5 风格** 的插件列表（`matches` / `exec` / `$t
 | GET | `/health` | 存活检查 |
 | GET | `/metrics` | Prometheus 文本 |
 | GET | `/api/stats` | JSON 计数 |
+| GET | `/api/system` | 版本、运行代标识、监听和插件配置、脱敏上游摘要 |
 | GET | `/api/plugins` | 已加载的 tag |
 | POST | `/api/query` | `{ "name", "qtype", "entry?", "ecs?", "client_ip?" }` — 带流水线 trace 的调试查询 |
-| POST | `/api/cache/flush` | 清空 LRU |
+| POST | `/api/cache/flush` | `{"tag":"cache"}` 清空指定缓存；空请求或 `{}` 清空全部 |
 
 ```sh
 cargo test --all

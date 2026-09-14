@@ -4,6 +4,9 @@
 
 ### English
 
+- Embed a Chinese web console in the binary: live metrics and query-rate chart, traced DNS queries, plugin inventory, targeted cache flushing, and read-only service configuration. Add sanitized system metadata and structured DNS records to the API while preserving existing fields.
+- Add console logic/DOM tests and real HTTP integration tests; Node.js tooling is only needed for frontend development checks.
+
 - Remove the Docker deployment path, image recipe, container example and related CI/documentation. Supported installation paths are the native binary, Cargo and systemd.
 - Set the minimum Rust version to 1.88 and test both that version and stable against the locked dependencies.
 - Bound and parallelize TLS handshakes; preserve the DoH peer address; acquire current rules for each query on persistent TCP/DoT connections.
@@ -15,6 +18,9 @@
 - Validate TTL/ECS bounds, support zero-length ECS prefixes, ignore hosts inline comments, validate diagnostic client addresses, and honor file logging.
 
 ### 简体中文
+
+- 二进制内嵌中文 Web 控制台，支持实时统计与查询趋势、DNS 查询追踪、插件清单、指定缓存清理和只读服务配置；API 增加脱敏实例信息与结构化 DNS 记录，保留原有字段。
+- 增加控制台逻辑、DOM 和真实 HTTP 接口测试；Node.js 工具仅用于前端开发检查。
 
 - 删除 Docker 部署入口、镜像文件、容器示例和相关 CI/文档，保留原生二进制、Cargo、systemd 安装方式。
 - 最低 Rust 版本调整为 1.88；CI 使用该版本和 stable 分别验证锁定依赖。
